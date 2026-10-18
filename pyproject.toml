@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "microchat"
+version = "0.1.0"
+description = "Micro chatbot terminal optimisé CPU : LangChain + llama.cpp + modèles GGUF + Rich"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # Messages et streaming LangChain utilisés par l'application et ses agents.
+    "langchain-core>=0.3",
+    # Agent tool-calling et runtime LangGraph.
+    "langchain>=1.0,<2.0",
+    "langgraph>=1.0,<2.0",
+    # Intégration llama.cpp.
+    "langchain-community>=0.3",
+    # Moteur d'inférence (binding Python de llama.cpp).
+    "llama-cpp-python>=0.3",
+    # Téléchargement du fichier GGUF depuis le Hugging Face Hub.
+    "huggingface-hub>=0.24",
+    # Schéma des arguments d'outils LangChain.
+    "pydantic>=2.7",
+    # Interface terminal.
+    "rich>=13.7",
+    # Détection des cœurs CPU physiques.
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5", "mypy>=1.10"]
+
+[project.scripts]
+microchat = "microchat.app:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/microchat"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "D", "ANN"]
+ignore = ["D107", "ANN401"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "ANN"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
