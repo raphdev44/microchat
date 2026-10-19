@@ -234,13 +234,27 @@ def resolve_model_path(settings: AppConfig) -> Path:
         raise RuntimeError(f"Impossible de récupérer un GGUF depuis le Hub : {exc}") from exc
 
 
+def _disable_chat_thinking(llm: Any) -> None:
+    """Désactive le mode réflexion des templates Jinja qui supportent enable_thinking."""
+    client = getattr(llm, "client", None)
+    handlers = getattr(client, "_chat_handlers", None)
+    chat_format = getattr(client, "chat_format", None)
+    handler = handlers.get(chat_format) if isinstance(handlers, Mapping) else None
+    for cell in getattr(handler, "__closure__", None) or ():
+        template = getattr(cell.cell_contents, "_environment", None)
+        for target in (template, getattr(template, "environment", None)):
+            globals_map = getattr(target, "globals", None)
+            if isinstance(globals_map, dict):
+                globals_map["enable_thinking"] = False
+
+
 def build_llm(settings: AppConfig, model_path: Path) -> Any:
     """Construit le modèle llama.cpp à partir des paramètres INI."""
     import psutil
     from langchain_community.chat_models import ChatLlamaCpp
 
     threads = settings.n_threads or psutil.cpu_count(logical=False) or os.cpu_count() or 1
-    return ChatLlamaCpp(
+    llm = ChatLlamaCpp(
         model_path=str(model_path),
         n_gpu_layers=0,
         n_threads=threads,
@@ -254,8 +268,12 @@ def build_llm(settings: AppConfig, model_path: Path) -> Any:
         top_k=settings.top_k,
         repeat_penalty=settings.repeat_penalty,
         verbose=settings.verbose,
+        disable_streaming="tool_calling",
         model_kwargs={"n_threads_batch": threads, "flash_attn": settings.flash_attn},
     )
+    if "/no_think" in settings.system_prompt:
+        _disable_chat_thinking(llm)
+    return llm
 
 
 def make_token_counter(llm: Any) -> Callable[[Sequence[BaseMessage]], int]:
@@ -456,6 +474,8 @@ class ChatApp:
                         tool_waiting = True
                         spinner = Spinner("dots", text=Text("Appel d'un outil…", style="dim"))
                         live.update(render(spinner))
+                    if tool_call_chunks or tool_calls:
+                        continue
                     if not text:
                         continue
                     now = perf_counter()

@@ -4,10 +4,12 @@ import configparser
 import io
 import json
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pytest
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 from rich.console import Console
 
@@ -15,7 +17,7 @@ from microchat.agents import weather
 from microchat.agents.runtime import build_agent
 from microchat.agents.weather import build_agent as build_weather_agent
 from microchat.app import ChatApp, _parse_command, _select_gguf, load_config
-from microchat.plugins import load_plugins
+from microchat.plugins import AgentPlugin, load_plugins
 
 
 class SimpleFakeModel(FakeMessagesListChatModel):
@@ -241,3 +243,99 @@ def test_chat_app_shows_weather_icon_when_subagent_is_used(monkeypatch):
     assert any("Appel d'un outil" in phase for phase in spinner_phases)
     assert any("Traitement du résultat" in phase for phase in spinner_phases)
     assert overflow_modes == ["ellipsis"]
+
+
+def test_chat_app_shows_weather_service_error(monkeypatch):
+    def unavailable(request, timeout):
+        raise HTTPError(request.full_url, 503, "Unavailable", {}, None)
+
+    monkeypatch.setattr("microchat.agents.weather.urlopen", unavailable)
+    plugin = weather.load_plugin({"timeout_seconds": "1"})
+    checkpointer = InMemorySaver()
+    agent = build_agent(
+        SimpleFakeModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "get_weather",
+                            "args": {"city": "Couëron"},
+                            "id": "weather-503",
+                        }
+                    ],
+                )
+            ]
+        ),
+        system_prompt="Réponds en français.",
+        plugins=(plugin,),
+        token_counter=count_words,
+        history_token_budget=100,
+        history_low_watermark=0.6,
+        checkpointer=checkpointer,
+    )
+    app = ChatApp(
+        agent,
+        checkpointer,
+        load_config(Path("config.ini")),
+        Path("fake.gguf"),
+        count_words,
+        plugin.tool_icons,
+    )
+    output = io.StringIO()
+    app.console = Console(file=output, force_terminal=False, width=100)
+
+    app._answer("Quel temps fait-il à Couëron ?")
+
+    rendered = output.getvalue()
+    assert weather.ICON in rendered
+    assert "Le service météo est indisponible" in rendered
+    assert "(réponse vide)" not in rendered
+
+
+def test_chat_app_hides_structured_tool_call_json():
+    @tool
+    def echo(value: str) -> str:
+        """Retourne le texte fourni."""
+        return value
+
+    plugin = AgentPlugin(
+        name="echo",
+        instructions="Utilise echo pour répéter le texte.",
+        tools=(echo,),
+        tool_icons={"echo": "🔧"},
+    )
+    checkpointer = InMemorySaver()
+    agent = build_agent(
+        SimpleFakeModel(
+            responses=[
+                AIMessage(
+                    content='{"name": "echo", "arguments": {"value": "bonjour"}}',
+                    tool_calls=[{"name": "echo", "args": {"value": "bonjour"}, "id": "echo-1"}],
+                ),
+                AIMessage(content="Bonjour !"),
+            ]
+        ),
+        system_prompt="Réponds en français.",
+        plugins=(plugin,),
+        token_counter=count_words,
+        history_token_budget=100,
+        history_low_watermark=0.6,
+        checkpointer=checkpointer,
+    )
+    app = ChatApp(
+        agent,
+        checkpointer,
+        load_config(Path("config.ini")),
+        Path("fake.gguf"),
+        count_words,
+        plugin.tool_icons,
+    )
+    output = io.StringIO()
+    app.console = Console(file=output, force_terminal=False, width=100)
+
+    app._answer("Répète bonjour")
+
+    rendered = output.getvalue()
+    assert '"name": "echo"' not in rendered
+    assert "Bonjour !" in rendered

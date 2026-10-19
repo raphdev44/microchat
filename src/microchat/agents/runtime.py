@@ -102,9 +102,23 @@ def build_agent(
     ) -> dict[str, list[BaseMessage]] | None:
         """Convertit les appels d'outil textuels des modèles locaux en appels structurés."""
         message = state["messages"][-1]
-        if not isinstance(message, AIMessage) or message.tool_calls:
+        if not isinstance(message, AIMessage):
             return None
         text = "".join(text_from_content(message.content))
+        if message.tool_calls:
+            if not text:
+                return {
+                    "messages": [
+                        AIMessage(
+                            content=" ",
+                            tool_calls=message.tool_calls,
+                            additional_kwargs=message.additional_kwargs,
+                            response_metadata=message.response_metadata,
+                            id=message.id,
+                        )
+                    ]
+                }
+            return None
         calls = _parse_text_tool_calls(text)
         if not calls:
             return None

@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from langchain.agents import AgentState
-from langchain.agents.middleware import after_model
+from langchain.agents.middleware import after_model, wrap_model_call
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
@@ -127,6 +127,17 @@ _MONTHS = (
     "décembre",
 )
 _DAY_PATTERN = re.compile(r"(?<!\d)(\d{1,2})(?:[/.-](\d{1,2}))?(?:[/.-](\d{4}))?(?!\d)")
+_WEATHER_REQUEST = re.compile(
+    r"\b(?:m[eé]t[eé]o|(?:il\s+fait\s+)?quel\s+temps\b|temps\s+qu['’]il\s+(?:fait|fera|va\s+faire)|"
+    r"temp[eé]rature\b|pleut(?:-il)?\b|pleuvoir\b|neige(?:r)?\b|orage\b|"
+    r"pr[eé]visions?\s+m[eé]t[eé]o)\b",
+    re.IGNORECASE,
+)
+
+
+def is_weather_request(query: str) -> bool:
+    """Indique si le message utilisateur porte explicitement sur la météo."""
+    return bool(_WEATHER_REQUEST.search(query))
 
 
 def _condition(code: Any) -> tuple[str, str]:
@@ -175,7 +186,9 @@ def _next_matching_date(today: date, day: int, month: int | None, year: int | No
 def resolve_day(when: str | None, today: date) -> date:
     """Convertit une expression de date française en date, relative au jour local."""
     text = " ".join((when or "").lower().replace("’", "'").split())
-    if text in ("", "aujourd'hui", "aujourdhui", "maintenant", "actuellement", "ce jour"):
+    if text in ("", "aujourd'hui", "aujourdhui", "maintenant", "actuellement", "ce jour") or (
+        re.fullmatch(r"(?:sur\s+)?\d+\s+jours?", text) is not None
+    ):
         return today
     if text == "demain":
         return today + timedelta(days=1)
@@ -397,6 +410,42 @@ def _make_weather_middleware() -> Any:
     return require_named_city
 
 
+def _make_weather_policy_middleware() -> Any:
+    """Expose et force l'outil météo uniquement quand la question porte sur la météo."""
+
+    @wrap_model_call
+    def route_weather_tool(request: Any, handler: Any) -> Any:
+        messages = request.state.get("messages", [])
+        user_message = next(
+            (message for message in reversed(messages) if isinstance(message, HumanMessage)),
+            None,
+        )
+        previous_assistant = next(
+            (item for item in reversed(messages) if isinstance(item, AIMessage)),
+            None,
+        )
+        pending = (
+            previous_assistant is not None
+            and previous_assistant.content == ASK_CITY
+            and bool(previous_assistant.additional_kwargs.get("pending_weather"))
+        )
+        query = " ".join(text_from_content(user_message.content)).strip() if user_message else ""
+        if pending or is_weather_request(query):
+            if any(getattr(item, "name", None) == TOOL_NAMES[0] for item in request.tools):
+                request = request.override(
+                    tool_choice={"type": "function", "function": {"name": TOOL_NAMES[0]}}
+                )
+        else:
+            request = request.override(
+                tools=[
+                    item for item in request.tools if getattr(item, "name", None) not in TOOL_NAMES
+                ]
+            )
+        return handler(request)
+
+    return route_weather_tool
+
+
 def load_plugin(config: Mapping[str, str]) -> AgentPlugin:
     """Construit le plugin météo à partir de ses paramètres dédiés."""
     try:
@@ -410,7 +459,7 @@ def load_plugin(config: Mapping[str, str]) -> AgentPlugin:
         instructions=INSTRUCTIONS,
         tools=(make_weather_tool(timeout),),
         tool_icons={TOOL_NAMES[0]: ICON},
-        middleware=(_make_weather_middleware(),),
+        middleware=(_make_weather_policy_middleware(), _make_weather_middleware()),
     )
 
 

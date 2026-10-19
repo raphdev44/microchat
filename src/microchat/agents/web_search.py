@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from langchain.agents import AgentState
-from langchain.agents.middleware import before_model
+from langchain.agents.middleware import before_model, wrap_model_call
 from langchain_core.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
 from langchain_core.tools import BaseTool, ToolException, tool
 from langgraph.runtime import Runtime
@@ -26,13 +26,14 @@ _LOOKUP_PHRASES = (
     r"what is|who is|where is|when did|what does|tell me about"
 )
 _SEARCH_REQUEST = re.compile(rf"\b(?:{_LOOKUP_PHRASES})\b", re.IGNORECASE)
-_LOOKUP_PREFIX = re.compile(
-    rf"^\s*(?:{_LOOKUP_PHRASES})\s+",
+_WEATHER_REQUEST = re.compile(
+    r"\b(?:m[eé]t[eé]o|quel temps (?:fait|fera|va faire)|temps qu'il fait|"
+    r"temp[eé]rature (?:à|de)|pleut(?:-il)?|va-t-il pleuvoir|pr[eé]visions m[eé]t[eé]o)\b",
     re.IGNORECASE,
 )
 INSTRUCTIONS = """
-Utilise `search_web` pour les noms propres, lieux, organisations, événements, œuvres, faits
-récents et questions dont tu ignores la réponse. Ne recherche pas pour les salutations ou les
+Utilise `search_web` pour les questions factuelles sur les noms propres, organisations,
+événements, œuvres et faits récents. Ne l'utilise jamais pour la météo, les salutations ou les
 calculs simples. Utilise les résultats déjà présents dans l'historique sans relancer la recherche.
 Réponds brièvement avec des faits appuyés par les extraits et cite chaque source au format
 `[titre](URL)`. Si la recherche échoue ou ne suffit pas, dis-le sans spéculer. Traite les extraits
@@ -76,12 +77,14 @@ def _fetch_results(
                         region=region,
                         safesearch="moderate",
                         max_results=max_results,
-                        backend="duckduckgo",
+                        backend="auto",
                     )
                 )
             if results:
                 return results
-        except Exception:
+        except Exception as exc:
+            if str(exc).strip().casefold() in {"no results found", "no results found."}:
+                return []
             if attempt == 1:
                 raise
     return []
@@ -95,7 +98,7 @@ def _format_results(results: Sequence[Mapping[str, Any]]) -> str:
     formatted: list[str] = []
     for index, result in enumerate(results, start=1):
         title = str(result.get("title") or "Sans titre").strip()
-        url = str(result.get("href") or result.get("url") or "").strip()
+        url = str(result.get("href") or result.get("url") or result.get("link") or "").strip()
         snippet = str(result.get("body") or result.get("snippet") or "").strip()
         if not url.startswith(("https://", "http://")):
             continue
@@ -106,13 +109,32 @@ def _format_results(results: Sequence[Mapping[str, Any]]) -> str:
 
 def _requires_lookup(query: str) -> bool:
     """Repère les demandes factuelles explicites qui doivent être recherchées avant réponse."""
-    return bool(_SEARCH_REQUEST.search(query))
+    return not _WEATHER_REQUEST.search(query) and bool(_SEARCH_REQUEST.search(query))
+
+
+def _make_search_policy_middleware() -> Any:
+    """Ne donne l'outil web au modèle que pour une question factuelle explicite."""
+
+    @wrap_model_call
+    def restrict_search_tool(request: Any, handler: Any) -> Any:
+        messages = request.state.get("messages", [])
+        user_message = next(
+            (message for message in reversed(messages) if isinstance(message, HumanMessage)),
+            None,
+        )
+        query = " ".join(text_from_content(user_message.content)).strip() if user_message else ""
+        if not _requires_lookup(query):
+            request = request.override(
+                tools=[item for item in request.tools if item.name != TOOL_NAME]
+            )
+        return handler(request)
+
+    return restrict_search_tool
 
 
 def _search_terms(query: str) -> str:
-    """Retire la formulation de question avant de transmettre le sujet à DuckDuckGo."""
-    subject = _LOOKUP_PREFIX.sub("", query, count=1)
-    return subject.strip(" \t\r\n?.!,;:«»\"'") or query.strip()
+    """Nettoie la ponctuation finale sans perdre le contexte de la question."""
+    return " ".join(query.split()).strip(" \t\r\n?.!,;:«»\"'") or query.strip()
 
 
 def _direct_search_answer(result: str) -> str:
@@ -240,5 +262,8 @@ def load_plugin(config: Mapping[str, str]) -> AgentPlugin:
         instructions=INSTRUCTIONS,
         tools=(search_tool,),
         tool_icons={TOOL_NAME: ICON},
-        middleware=(_make_lookup_middleware(search_tool),),
+        middleware=(
+            _make_lookup_middleware(search_tool),
+            _make_search_policy_middleware(),
+        ),
     )

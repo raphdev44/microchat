@@ -7,9 +7,10 @@ from datetime import date, timedelta
 from urllib.error import HTTPError
 
 import pytest
+from langchain.agents.middleware.types import ModelRequest
 from langchain_community.chat_models.llamacpp import _convert_message_to_dict
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import ToolException
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -17,6 +18,8 @@ from microchat.agents.weather import (
     ASK_CITY,
     build_agent,
     format_day,
+    is_weather_request,
+    load_plugin,
     make_weather_tool,
     parse_text_tool_calls,
     resolve_day,
@@ -323,3 +326,72 @@ def test_visible_text_hides_complete_and_partial_tool_calls():
     assert visible_text("<think>\n\n</think>\n\nSalut !") == "Salut !"
     assert visible_text("<think>\nje réfléch") == ""
     assert parse_text_tool_calls("Bonjour") == []
+
+
+def test_weather_policy_hides_tool_on_casual_chat_and_forces_it_on_weather():
+    plugin = load_plugin({"timeout_seconds": "5"})
+    policy = plugin.middleware[0]
+    casual = HumanMessage(content="est-ce que tu vas bien ?")
+    weather_msg = HumanMessage(content="il fait quel temps à angers ?")
+
+    casual_req = ModelRequest(
+        model=ToolCallingFake(responses=[AIMessage(content="Oui !")]),
+        messages=[casual],
+        tools=list(plugin.tools),
+        state={"messages": [casual]},
+    )
+    weather_req = ModelRequest(
+        model=ToolCallingFake(responses=[AIMessage(content=" ")]),
+        messages=[weather_msg],
+        tools=list(plugin.tools),
+        state={"messages": [weather_msg]},
+    )
+
+    seen: list[tuple[list[str], object]] = []
+    for req in (casual_req, weather_req):
+        policy.wrap_model_call(
+            req,
+            lambda updated: (
+                seen.append(([t.name for t in updated.tools], updated.tool_choice))
+                or AIMessage(content="ok")
+            ),
+        )
+
+    assert not is_weather_request("est-ce que tu vas bien ?")
+    assert is_weather_request("il fait quel temps à angers ?")
+    assert seen == [
+        ([], None),
+        (["get_weather"], {"type": "function", "function": {"name": "get_weather"}}),
+    ]
+
+
+def test_structured_tool_call_preserves_non_empty_content_for_jinja():
+    checkpointer = InMemorySaver()
+    agent = build_agent(
+        ToolCallingFake(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"name": "get_weather", "args": {"city": "Angers"}, "id": "call-1"}
+                    ],
+                )
+            ]
+        ),
+        system_prompt="Réponds en français.",
+        instructions="Utilise la météo.",
+        token_counter=count_words,
+        history_token_budget=100,
+        history_low_watermark=0.6,
+        checkpointer=checkpointer,
+        weather_timeout_seconds=1,
+    )
+    config = {"configurable": {"thread_id": "jinja-non-null"}}
+
+    agent.invoke(
+        {"messages": [{"role": "user", "content": "il fait quel temps à Angers ?"}]},
+        config,
+    )
+
+    messages = agent.get_state(config).values["messages"]
+    assert _convert_message_to_dict(messages[1])["content"] is not None
