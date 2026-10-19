@@ -7,7 +7,7 @@ import configparser
 import logging
 import os
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -35,8 +35,9 @@ from rich.table import Table
 from rich.text import Text
 
 from microchat import __version__
-from microchat.agents import TOOL_ICONS
-from microchat.agents.weather import build_agent, text_from_content, visible_text
+from microchat.agents.runtime import build_agent as build_plugin_agent
+from microchat.agents.runtime import text_from_content, visible_text
+from microchat.plugins import load_plugins
 
 logger = logging.getLogger(__name__)
 CONFIG_PATH = Path.cwd() / "config.ini"
@@ -62,13 +63,13 @@ class AppConfig:
     top_k: int
     repeat_penalty: float
     system_prompt: str
-    agent_instructions: str
+    plugins: tuple[str, ...]
+    plugin_configurations: Mapping[str, Mapping[str, str]]
     prompt_reserve_tokens: int
     history_low_watermark: float
     session_id: str
     render_refresh_hz: int
     render_interval_seconds: float
-    weather_timeout_seconds: int
     verbose: bool
 
     @property
@@ -105,13 +106,12 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         "top_k",
         "repeat_penalty",
         "system_prompt",
-        "agent_instructions",
+        "plugins",
         "prompt_reserve_tokens",
         "history_low_watermark",
         "session_id",
         "render_refresh_hz",
         "render_interval_seconds",
-        "weather_timeout_seconds",
         "verbose",
     }
     missing = sorted(required - set(section))
@@ -120,6 +120,12 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         raise ValueError(f"Paramètres manquants dans [microchat] : {', '.join(missing)}")
     if unknown:
         raise ValueError(f"Paramètres inconnus dans [microchat] : {', '.join(unknown)}")
+    plugin_sections = {
+        name for name in parser.sections() if name.startswith("plugin:") and len(name) > 7
+    }
+    unknown_sections = set(parser.sections()) - {"microchat"} - plugin_sections
+    if unknown_sections:
+        raise ValueError(f"Sections inconnues : {', '.join(sorted(unknown_sections))}")
 
     def read_int(name: str) -> int:
         value = section.getint(name)
@@ -157,13 +163,15 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         top_k=read_int("top_k"),
         repeat_penalty=read_float("repeat_penalty"),
         system_prompt=section["system_prompt"],
-        agent_instructions=section["agent_instructions"],
+        plugins=tuple(name.strip() for name in section["plugins"].split(",") if name.strip()),
+        plugin_configurations={
+            name.removeprefix("plugin:"): dict(parser[name]) for name in plugin_sections
+        },
         prompt_reserve_tokens=read_int("prompt_reserve_tokens"),
         history_low_watermark=read_float("history_low_watermark"),
         session_id=section["session_id"].strip(),
         render_refresh_hz=read_int("render_refresh_hz"),
         render_interval_seconds=read_float("render_interval_seconds"),
-        weather_timeout_seconds=read_int("weather_timeout_seconds"),
         verbose=read_bool("verbose"),
     )
     if not settings.model_repo_id:
@@ -180,8 +188,6 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         raise ValueError("history_low_watermark doit être dans ]0, 1].")
     if settings.render_refresh_hz < 1 or settings.render_interval_seconds < 0:
         raise ValueError("Les réglages de rafraîchissement Rich sont invalides.")
-    if settings.weather_timeout_seconds < 1:
-        raise ValueError("weather_timeout_seconds doit être supérieur à zéro.")
     return settings
 
 
@@ -300,11 +306,15 @@ class ChatApp:
         checkpointer: InMemorySaver,
         settings: AppConfig,
         model_path: Path,
+        token_counter: Callable[[Sequence[BaseMessage]], int],
+        tool_icons: Mapping[str, str] | None = None,
     ) -> None:
         self.agent = agent
         self.checkpointer = checkpointer
         self.settings = settings
         self.model_path = model_path
+        self.token_counter = token_counter
+        self.tool_icons = dict(tool_icons or {})
         self.console = Console()
         self.session_id = settings.session_id
 
@@ -317,7 +327,7 @@ class ChatApp:
             "Modèle": self.model_path.name,
             "Threads CPU": str(self.settings.n_threads or "auto"),
             "Contexte": str(self.settings.n_ctx),
-            "Agent": "météo Open-Meteo",
+            "Plugins": ", ".join(self.settings.plugins) or "aucun",
         }
         banner = Group(
             Text(f"microchat v{__version__} — chatbot local 100 % CPU"),
@@ -405,7 +415,7 @@ class ChatApp:
         first_token_at = start
         last_render = 0.0
         spinner = Spinner("dots", text=Text("Réflexion…", style="dim"))
-        weather_waiting = False
+        tool_waiting = False
         icons: list[str] = []
 
         def render(body: RenderableType) -> RenderableType:
@@ -416,16 +426,16 @@ class ChatApp:
                 spinner,
                 console=self.console,
                 refresh_per_second=self.settings.render_refresh_hz,
-                vertical_overflow="visible",
+                vertical_overflow="ellipsis",
             ) as live:
                 for chunk, _metadata in chunks:
                     if isinstance(chunk, ToolMessage):
-                        icon = TOOL_ICONS.get(chunk.name or "")
+                        icon = self.tool_icons.get(chunk.name or "")
                         if icon and icon not in icons:
                             icons.append(icon)
                         if icon:
                             spinner = Spinner(
-                                "dots", text=Text("Mise en forme des prévisions…", style="dim")
+                                "dots", text=Text("Traitement du résultat…", style="dim")
                             )
                             live.update(render(spinner))
                         result = visible_text("".join(text_from_content(chunk.content)))
@@ -436,17 +446,15 @@ class ChatApp:
                     text = "".join(text_from_content(chunk.content))
                     tool_call_chunks = getattr(chunk, "tool_call_chunks", [])
                     tool_calls = getattr(chunk, "tool_calls", [])
-                    if not weather_waiting and (
+                    if not tool_waiting and (
                         "<tool_call>" in "".join(parts) + text
                         or any(
-                            tool_call.get("name") == "get_weather"
+                            tool_call.get("name") in self.tool_icons
                             for tool_call in [*tool_call_chunks, *tool_calls]
                         )
                     ):
-                        weather_waiting = True
-                        spinner = Spinner(
-                            "dots", text=Text("Consultation d'Open-Meteo…", style="dim")
-                        )
+                        tool_waiting = True
+                        spinner = Spinner("dots", text=Text("Appel d'un outil…", style="dim"))
                         live.update(render(spinner))
                     if not text:
                         continue
@@ -483,7 +491,14 @@ class ChatApp:
         if not self.console.is_terminal:
             self.console.print()
         elapsed = perf_counter() - start
-        tokens = len(parts)
+        if isinstance(last, AIMessage) and last.additional_kwargs.get("microchat_auto_search_for"):
+            self.console.print(f"[dim]Recherche web · total {elapsed:.1f}s[/]\n")
+            return
+        empty_message_tokens = self.token_counter([AIMessage(content="")])
+        tokens = max(
+            0,
+            self.token_counter([AIMessage(content=answer)]) - empty_message_tokens,
+        )
         first_token_s = first_token_at - start
         decode_time = elapsed - first_token_s
         rate = (tokens - 1) / decode_time if tokens > 1 and decode_time > 0 else 0
@@ -495,7 +510,7 @@ class ChatApp:
 
 def run() -> int:
     """Charge config.ini, prépare le modèle et lance la boucle."""
-    parser = argparse.ArgumentParser(description="Microchat local avec agent météo.")
+    parser = argparse.ArgumentParser(description="Microchat local extensible par plugins-agent.")
     parser.add_argument("--version", action="version", version=f"microchat {__version__}")
     parser.parse_args()
 
@@ -522,17 +537,21 @@ def run() -> int:
                 except Exception:
                     logger.warning("Pré-chauffage du modèle impossible", exc_info=True)
         checkpointer = InMemorySaver()
-        agent = build_agent(
+        plugins = load_plugins(settings.plugins, settings.plugin_configurations)
+        token_counter = make_token_counter(llm)
+        agent = build_plugin_agent(
             llm,
             system_prompt=settings.system_prompt,
-            instructions=settings.agent_instructions,
-            token_counter=make_token_counter(llm),
+            plugins=plugins,
+            token_counter=token_counter,
             history_token_budget=settings.history_token_budget,
             history_low_watermark=settings.history_low_watermark,
             checkpointer=checkpointer,
-            weather_timeout_seconds=settings.weather_timeout_seconds,
         )
-        ChatApp(agent, checkpointer, settings, model_path).run()
+        tool_icons = {
+            tool_name: icon for plugin in plugins for tool_name, icon in plugin.tool_icons.items()
+        }
+        ChatApp(agent, checkpointer, settings, model_path, token_counter, tool_icons).run()
     except (ValueError, RuntimeError, OSError, configparser.Error) as exc:
         print(f"Erreur : {exc}", file=sys.stderr)
         return 1

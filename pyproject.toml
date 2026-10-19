@@ -30,9 +30,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.5", "mypy>=1.10"]
+search = ["ddgs>=9"]
 
 [project.scripts]
 microchat = "microchat.app:run"
+
+[project.entry-points."microchat.plugins"]
+weather = "microchat.agents.weather:load_plugin"
+web_search = "microchat.agents.web_search:load_plugin"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/microchat"]

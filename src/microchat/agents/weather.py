@@ -1,4 +1,4 @@
-"""Agent météo autonome : instructions, outil Open-Meteo et graphe LangGraph."""
+"""Plugin météo : instructions, outil Open-Meteo et règle de ville obligatoire."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ import json
 import re
 import time
 import unicodedata
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import date, timedelta
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -14,28 +15,39 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
-from langchain.agents import AgentState, create_agent
-from langchain.agents.middleware import after_model, before_model
+from langchain.agents import AgentState
+from langchain.agents.middleware import after_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     HumanMessage,
-    RemoveMessage,
     ToolCall,
 )
-from langchain_core.messages.utils import trim_messages
 from langchain_core.tools import BaseTool, ToolException, tool
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph.message import REMOVE_ALL_MESSAGES
-from langgraph.graph.state import CompiledStateGraph
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, Field, field_validator
+
+from microchat.agents.runtime import _parse_text_tool_calls as parse_text_tool_calls
+from microchat.agents.runtime import build_agent as build_runtime_agent
+from microchat.agents.runtime import text_from_content, visible_text
+from microchat.plugins import AgentPlugin
+
+__all__ = ["parse_text_tool_calls", "visible_text"]
 
 ICON = "🌦️"
 TOOL_NAMES = ("get_weather",)
 MAX_FORECAST_DAYS = 16
 ASK_CITY = "Pour quelle ville voulez-vous la météo ?"
+INSTRUCTIONS = (
+    "UTILISE IMPÉRATIVEMENT L'OUTIL 'get_weather' dès qu'une ville est mentionnée pour la météo. "
+    "Si l'utilisateur n'a cité aucune ville, demande-lui laquelle au lieu d'en choisir une. "
+    "N'écris JAMAIS de texte expliquant que tu vas appeler l'outil : déclenche l'appel d'outil "
+    "directement. Pour une date, recopie dans 'when' l'expression de l'utilisateur telle quelle "
+    "(demain, samedi, le 21…) sans la convertir. Pour plusieurs jours (« sur 3 jours », "
+    "« cette semaine »), indique le nombre de jours dans 'days'. Le résultat de l'outil est "
+    "affiché tel quel à l'utilisateur."
+)
 
 
 class WeatherQuery(BaseModel):
@@ -195,42 +207,6 @@ def resolve_day(when: str | None, today: date) -> date:
     )
 
 
-# Format Hermes/Qwen ; un bloc non fermé est accepté pendant le streaming.
-_TOOL_CALL_PATTERN = re.compile(r"<tool_call>(.*?)(?:</tool_call>|$)", re.DOTALL)
-# Qwen3 émet un bloc de réflexion, vide avec /no_think, que Rich rend en lignes vides.
-_THINK_PATTERN = re.compile(r"<think>.*?(?:</think>|$)", re.DOTALL)
-
-
-def visible_text(text: str) -> str:
-    """Retire les balises de réflexion et d'appel d'outil du texte affiché."""
-    return _TOOL_CALL_PATTERN.sub("", _THINK_PATTERN.sub("", text)).strip()
-
-
-def parse_text_tool_calls(text: str) -> list[ToolCall]:
-    """Extrait les appels d'outil écrits en texte par les modèles locaux."""
-    calls: list[ToolCall] = []
-    for block in _TOOL_CALL_PATTERN.findall(text):
-        try:
-            # raw_decode tolère les caractères parasites après le JSON.
-            payload, _end = json.JSONDecoder().raw_decode(block.strip())
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict) or not isinstance(payload.get("name"), str):
-            continue
-        args = payload.get("arguments", {})
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except json.JSONDecodeError:
-                continue
-        if not isinstance(args, dict):
-            continue
-        calls.append(
-            ToolCall(name=payload["name"], args=args, id=f"call_{uuid4().hex}", type="tool_call")
-        )
-    return calls
-
-
 def make_weather_tool(timeout_seconds: int) -> BaseTool:
     """Construit l'outil météo avec le délai réseau fourni par la configuration."""
 
@@ -358,54 +334,8 @@ def make_weather_tool(timeout_seconds: int) -> BaseTool:
     return get_weather
 
 
-def build_agent(
-    llm: BaseChatModel,
-    *,
-    system_prompt: str,
-    instructions: str,
-    token_counter: Callable[[Sequence[BaseMessage]], int],
-    history_token_budget: int,
-    history_low_watermark: float,
-    checkpointer: InMemorySaver,
-    weather_timeout_seconds: int,
-) -> CompiledStateGraph[Any, Any, Any, Any]:
-    """Assemble l'agent météo à partir du modèle et des paramètres de l'INI."""
-    weather_tool = make_weather_tool(weather_timeout_seconds)
-
-    @before_model
-    def trim_history(
-        state: AgentState, runtime: Runtime[None]
-    ) -> dict[str, list[BaseMessage]] | None:
-        """Purge par paliers l'historique lorsque son budget de tokens est dépassé."""
-        messages = state["messages"]
-        if token_counter(messages) <= history_token_budget:
-            return None
-        trimmed = trim_messages(
-            messages,
-            max_tokens=max(1, int(history_token_budget * history_low_watermark)),
-            token_counter=token_counter,
-            strategy="last",
-            start_on="human",
-            allow_partial=False,
-        )
-        return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *trimmed]}
-
-    @after_model
-    def extract_text_tool_calls(
-        state: AgentState, runtime: Runtime[None]
-    ) -> dict[str, list[BaseMessage]] | None:
-        """Remplace une réponse ``<tool_call>`` textuelle par un appel d'outil structuré."""
-        message = state["messages"][-1]
-        if not isinstance(message, AIMessage) or message.tool_calls:
-            return None
-        text = "".join(text_from_content(message.content))
-        calls = parse_text_tool_calls(text)
-        if not calls:
-            return None
-        # ChatLlamaCpp convertit "" en None, ce que le template Jinja de Qwen3 refuse.
-        content = visible_text(text) or " "
-        # Même id : add_messages remplace le message au lieu de l'ajouter.
-        return {"messages": [AIMessage(content=content, tool_calls=calls, id=message.id)]}
+def _make_weather_middleware() -> Any:
+    """Crée le contrôle météo qui demande une ville avant l'appel réseau."""
 
     @after_model
     def require_named_city(
@@ -464,25 +394,46 @@ def build_agent(
                 }
         return None
 
-    return create_agent(
-        model=llm,
-        tools=[weather_tool],
-        system_prompt=f"{system_prompt}\n\n{instructions}",
-        # Les hooks after_model s'exécutent du dernier au premier.
-        middleware=[trim_history, require_named_city, extract_text_tool_calls],
-        checkpointer=checkpointer,
-        name="microchat_weather_agent",
+    return require_named_city
+
+
+def load_plugin(config: Mapping[str, str]) -> AgentPlugin:
+    """Construit le plugin météo à partir de ses paramètres dédiés."""
+    try:
+        timeout = int(config.get("timeout_seconds", "30"))
+    except ValueError as exc:
+        raise ValueError("plugin:weather timeout_seconds doit être un entier.") from exc
+    if timeout < 1:
+        raise ValueError("plugin:weather timeout_seconds doit être supérieur à zéro.")
+    return AgentPlugin(
+        name="weather",
+        instructions=INSTRUCTIONS,
+        tools=(make_weather_tool(timeout),),
+        tool_icons={TOOL_NAMES[0]: ICON},
+        middleware=(_make_weather_middleware(),),
     )
 
 
-def text_from_content(content: str | list[Any]) -> Iterable[str]:
-    """Extrait le texte des contenus LangChain texte ou multimodaux."""
-    if isinstance(content, str):
-        if content:
-            yield content
-        return
-    for block in content:
-        if isinstance(block, dict) and block.get("type") == "text":
-            text = block.get("text")
-            if isinstance(text, str) and text:
-                yield text
+def build_agent(
+    llm: BaseChatModel,
+    *,
+    system_prompt: str,
+    instructions: str,
+    token_counter: Callable[[Sequence[BaseMessage]], int],
+    history_token_budget: int,
+    history_low_watermark: float,
+    checkpointer: Any,
+    weather_timeout_seconds: int,
+) -> Any:
+    """Compatibilité : assemble le graphe principal avec le seul plugin météo."""
+    plugin = load_plugin({"timeout_seconds": str(weather_timeout_seconds)})
+    plugin = replace(plugin, instructions=instructions)
+    return build_runtime_agent(
+        llm,
+        system_prompt=system_prompt,
+        plugins=(plugin,),
+        token_counter=token_counter,
+        history_token_budget=history_token_budget,
+        history_low_watermark=history_low_watermark,
+        checkpointer=checkpointer,
+    )

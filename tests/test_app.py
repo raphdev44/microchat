@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import configparser
 import io
 import json
 from pathlib import Path
@@ -11,8 +12,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 from rich.console import Console
 
 from microchat.agents import weather
-from microchat.agents.weather import build_agent
+from microchat.agents.runtime import build_agent
+from microchat.agents.weather import build_agent as build_weather_agent
 from microchat.app import ChatApp, _parse_command, _select_gguf, load_config
+from microchat.plugins import load_plugins
 
 
 class SimpleFakeModel(FakeMessagesListChatModel):
@@ -30,11 +33,39 @@ def count_words(messages: list[BaseMessage]) -> int:
 def test_loads_complete_ini_configuration():
     settings = load_config(Path("config.ini"))
 
-    assert settings.model_repo_id == "Qwen/Qwen3-1.7B-GGUF"
+    assert settings.model_repo_id
     assert settings.n_ctx >= 512
     assert settings.history_token_budget > 0
     assert settings.session_id == "terminal"
-    assert settings.weather_timeout_seconds == 30
+    assert settings.plugins == ("weather", "web_search")
+    assert settings.plugin_configurations["weather"]["timeout_seconds"] == "30"
+    assert settings.plugin_configurations["web_search"]["timeout_seconds"] == "5"
+    assert settings.plugin_configurations["web_search"]["max_results"] == "5"
+
+
+def test_plugin_registry_accepts_no_active_plugins():
+    assert load_plugins((), {}) == ()
+
+
+def test_plugin_registry_loads_selected_entry_point(monkeypatch):
+    class WeatherEntryPoint:
+        name = "weather"
+
+        @staticmethod
+        def load():
+            return weather.load_plugin
+
+    monkeypatch.setattr("microchat.plugins.entry_points", lambda **_kwargs: [WeatherEntryPoint()])
+
+    (plugin,) = load_plugins(("weather",), {"weather": {"timeout_seconds": "7"}})
+
+    assert plugin.name == "weather"
+    assert plugin.tools[0].name == "get_weather"
+
+
+def test_plugin_registry_rejects_uninstalled_plugin():
+    with pytest.raises(ValueError, match="Plugins non installés"):
+        load_plugins(("missing-plugin",), {})
 
 
 def test_config_rejects_missing_parameters(tmp_path):
@@ -47,11 +78,13 @@ def test_config_rejects_missing_parameters(tmp_path):
 
 def test_config_rejects_unknown_parameters(tmp_path):
     path = Path("config.ini")
-    text = path.read_text(encoding="utf-8").replace(
-        "model_repo_id =", "unexpected_option = true\nmodel_repo_id ="
-    )
+    parser = configparser.ConfigParser(interpolation=None)
+    with path.open(encoding="utf-8") as config_file:
+        parser.read_file(config_file)
+    parser["microchat"]["unexpected_option"] = "true"
     unknown = tmp_path / "config.ini"
-    unknown.write_text(text, encoding="utf-8")
+    with unknown.open("w", encoding="utf-8") as config_file:
+        parser.write(config_file)
 
     with pytest.raises(ValueError, match="Paramètres inconnus"):
         load_config(unknown)
@@ -86,15 +119,14 @@ def test_chat_app_runs_chat_and_commands(monkeypatch):
     agent = build_agent(
         SimpleFakeModel(responses=[AIMessage(content="Bonjour !")]),
         system_prompt="Réponds brièvement.",
-        instructions="N'appelle pas d'outil pour ce test.",
+        plugins=(),
         token_counter=count_words,
         history_token_budget=100,
         history_low_watermark=0.6,
         checkpointer=checkpointer,
-        weather_timeout_seconds=3,
     )
     settings = load_config(Path("config.ini"))
-    app = ChatApp(agent, checkpointer, settings, Path("fake.gguf"))
+    app = ChatApp(agent, checkpointer, settings, Path("fake.gguf"), count_words)
     output = io.StringIO()
     app.console = Console(file=output, force_terminal=False, width=100)
     prompts = iter(["bonjour", "/info", "/clear", "/quit"])
@@ -116,10 +148,12 @@ def test_weather_tool_names_match_declared_tools():
 
 def test_chat_app_shows_weather_icon_when_subagent_is_used(monkeypatch):
     spinner_phases = []
+    overflow_modes = []
 
     class RecordingLive:
         def __init__(self, renderable, **kwargs):
             self.console = kwargs["console"]
+            overflow_modes.append(kwargs["vertical_overflow"])
             self.update(renderable)
 
         def __enter__(self):
@@ -165,7 +199,7 @@ def test_chat_app_shows_weather_icon_when_subagent_is_used(monkeypatch):
         ),
     )
     checkpointer = InMemorySaver()
-    agent = build_agent(
+    agent = build_weather_agent(
         SimpleFakeModel(
             responses=[
                 AIMessage(
@@ -185,7 +219,14 @@ def test_chat_app_shows_weather_icon_when_subagent_is_used(monkeypatch):
         checkpointer=checkpointer,
         weather_timeout_seconds=3,
     )
-    app = ChatApp(agent, checkpointer, load_config(Path("config.ini")), Path("fake.gguf"))
+    app = ChatApp(
+        agent,
+        checkpointer,
+        load_config(Path("config.ini")),
+        Path("fake.gguf"),
+        count_words,
+        {"get_weather": weather.ICON},
+    )
     output = io.StringIO()
     app.console = Console(file=output, force_terminal=False, width=100)
 
@@ -197,5 +238,6 @@ def test_chat_app_shows_weather_icon_when_subagent_is_used(monkeypatch):
     assert "🌧️ pluie faible" in rendered
     assert "Reformulation" not in rendered
     assert app._message_count() == 2
-    assert any("Consultation d'Open-Meteo" in phase for phase in spinner_phases)
-    assert any("Mise en forme des prévisions" in phase for phase in spinner_phases)
+    assert any("Appel d'un outil" in phase for phase in spinner_phases)
+    assert any("Traitement du résultat" in phase for phase in spinner_phases)
+    assert overflow_modes == ["ellipsis"]
