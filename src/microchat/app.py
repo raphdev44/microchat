@@ -20,12 +20,13 @@ from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
     RemoveMessage,
+    ToolMessage,
 )
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.graph.state import CompiledStateGraph
-from rich.console import Console, Group
+from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -34,7 +35,8 @@ from rich.table import Table
 from rich.text import Text
 
 from microchat import __version__
-from microchat.agents.weather import build_agent, text_from_content
+from microchat.agents import TOOL_ICONS
+from microchat.agents.weather import build_agent, text_from_content, visible_text
 
 logger = logging.getLogger(__name__)
 CONFIG_PATH = Path.cwd() / "config.ini"
@@ -375,7 +377,7 @@ class ChatApp:
     def _message_count(self) -> int:
         messages = self.agent.get_state(self._config()).values.get("messages", [])
         return sum(
-            isinstance(message, HumanMessage)
+            isinstance(message, (HumanMessage, ToolMessage))
             or (isinstance(message, AIMessage) and not message.tool_calls)
             for message in messages
         )
@@ -403,6 +405,12 @@ class ChatApp:
         first_token_at = start
         last_render = 0.0
         spinner = Spinner("dots", text=Text("Réflexion…", style="dim"))
+        weather_waiting = False
+        icons: list[str] = []
+
+        def render(body: RenderableType) -> RenderableType:
+            return Group(Text(" ".join(icons)), body) if icons else body
+
         try:
             with Live(
                 spinner,
@@ -411,9 +419,35 @@ class ChatApp:
                 vertical_overflow="visible",
             ) as live:
                 for chunk, _metadata in chunks:
+                    if isinstance(chunk, ToolMessage):
+                        icon = TOOL_ICONS.get(chunk.name or "")
+                        if icon and icon not in icons:
+                            icons.append(icon)
+                        if icon:
+                            spinner = Spinner(
+                                "dots", text=Text("Mise en forme des prévisions…", style="dim")
+                            )
+                            live.update(render(spinner))
+                        result = visible_text("".join(text_from_content(chunk.content)))
+                        live.update(render(Markdown(result) if result else spinner))
+                        continue
                     if not isinstance(chunk, (AIMessage, AIMessageChunk)):
                         continue
                     text = "".join(text_from_content(chunk.content))
+                    tool_call_chunks = getattr(chunk, "tool_call_chunks", [])
+                    tool_calls = getattr(chunk, "tool_calls", [])
+                    if not weather_waiting and (
+                        "<tool_call>" in "".join(parts) + text
+                        or any(
+                            tool_call.get("name") == "get_weather"
+                            for tool_call in [*tool_call_chunks, *tool_calls]
+                        )
+                    ):
+                        weather_waiting = True
+                        spinner = Spinner(
+                            "dots", text=Text("Consultation d'Open-Meteo…", style="dim")
+                        )
+                        live.update(render(spinner))
                     if not text:
                         continue
                     now = perf_counter()
@@ -421,9 +455,18 @@ class ChatApp:
                         first_token_at = now
                     parts.append(text)
                     if now - last_render >= self.settings.render_interval_seconds:
-                        live.update(Markdown("".join(parts)))
+                        answer = visible_text("".join(parts))
+                        live.update(render(Markdown(answer) if answer else spinner))
                         last_render = now
-                live.update(Markdown("".join(parts)) if parts else Text("(réponse vide)"))
+                # Le message final peut être un résultat d'outil direct ou réécrit par un hook.
+                final = self.agent.get_state(config).values.get("messages", [])
+                last = final[-1] if final else None
+                answer = (
+                    visible_text("".join(text_from_content(last.content)))
+                    if isinstance(last, (AIMessage, ToolMessage))
+                    else ""
+                )
+                live.update(render(Markdown(answer) if answer else Text("(réponse vide)")))
         except (Exception, GeneratorExit, KeyboardInterrupt):
             current = self.agent.get_state(config).values.get("messages", [])
             if current != previous:

@@ -7,7 +7,7 @@ name = "microchat"
 version = "0.1.0"
 description = "Micro chatbot terminal optimisé CPU : LangChain + llama.cpp + modèles GGUF + Rich"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     # Messages et streaming LangChain utilisés par l'application et ses agents.
     "langchain-core>=0.3",
@@ -43,7 +43,7 @@ filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "D", "ANN"]
@@ -56,6 +56,6 @@ convention = "google"
 "tests/*" = ["D", "ANN"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 strict = true
 ignore_missing_imports = true
