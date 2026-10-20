@@ -113,6 +113,8 @@ _LOOKUP_PHRASES = (
     r"what is|who is|where is|when did|what does|tell me about"
 )
 _SEARCH_REQUEST = re.compile(rf"\b(?:{_LOOKUP_PHRASES})\b", re.IGNORECASE)
+_SEARCH_PREFIX = re.compile(rf"^\s*(?:{_LOOKUP_PHRASES})\s+", re.IGNORECASE)
+_IDENTITY_PREFIX = re.compile(r"^\s*(?:c['’]est qui|qui est|who is)\s+", re.IGNORECASE)
 _WEATHER_REQUEST = re.compile(
     r"\b(?:m[eé]t[eé]o|quel temps (?:fait|fera|va faire)|temps qu'il fait|"
     r"temp[eé]rature (?:à|de)|pleut(?:-il)?|va-t-il pleuvoir|pr[eé]visions m[eé]t[eé]o)\b",
@@ -228,6 +230,24 @@ def _clean_and_rank_results(
 
     if not subject:
         return cleaned
+
+    if query.startswith('"') and query.endswith('"'):
+        exact_name = _plain_tokens(query[1:-1])
+        if exact_name:
+
+            def contains_name(value: str) -> bool:
+                tokens = _plain_tokens(value)
+                return any(
+                    tokens[index : index + len(exact_name)] == exact_name
+                    for index in range(len(tokens) - len(exact_name) + 1)
+                )
+
+            return [
+                item
+                for item in cleaned
+                if contains_name(str(item.get("title") or ""))
+                or contains_name(str(item.get("href") or item.get("url") or item.get("link") or ""))
+            ]
 
     scored: list[tuple[int, int, int, dict[str, Any]]] = []
     for index, item in enumerate(cleaned):
@@ -432,6 +452,16 @@ def _search_terms(query: str) -> str:
     return " ".join(query.split()).strip(" \t\r\n?.!,;:«»\"'") or query.strip()
 
 
+def _ddg_query(query: str) -> str:
+    """Normalise les préfixes interrogatifs avant de former la requête DuckDuckGo."""
+    normalized = " ".join(query.split())
+    subject = _SEARCH_PREFIX.sub("", normalized, count=1)
+    terms = _search_terms(subject or normalized).casefold()
+    if _IDENTITY_PREFIX.match(normalized) and len(_plain_tokens(terms)) == 2:
+        return f'"{terms}"'
+    return terms
+
+
 def _search_data(
     query: str, *, region: str, timeout_seconds: int, max_results: int
 ) -> tuple[str, list[dict[str, str]]]:
@@ -497,7 +527,7 @@ def _make_lookup_middleware(search: Callable[[str], tuple[str, list[dict[str, st
             return None
 
         tool_call_id = f"call_{uuid4().hex}"
-        search_query = _search_terms(query)[:500]
+        search_query = _ddg_query(query)[:500]
         try:
             result, sources = search(search_query)
         except ToolException as exc:
@@ -505,31 +535,37 @@ def _make_lookup_middleware(search: Callable[[str], tuple[str, list[dict[str, st
         tool_content = (
             f"Question : {query}\n\nExtraits de recherche :\n{result}" if sources else result
         )
-        return {
-            "messages": [
+        search_messages: list[BaseMessage] = [
+            AIMessage(
+                content=" ",
+                tool_calls=[
+                    ToolCall(
+                        name=TOOL_NAME,
+                        args={"query": search_query},
+                        id=tool_call_id,
+                        type="tool_call",
+                    )
+                ],
+                additional_kwargs={
+                    "microchat_auto_search_for": search_key,
+                    "microchat_search_sources": sources,
+                },
+            ),
+            ToolMessage(
+                content=tool_content,
+                name=TOOL_NAME,
+                tool_call_id=tool_call_id,
+                additional_kwargs={"microchat_hide_output": True},
+            ),
+        ]
+        if search_query.startswith('"') and result.startswith("Aucun résultat pertinent"):
+            search_messages.append(
                 AIMessage(
-                    content=" ",
-                    tool_calls=[
-                        ToolCall(
-                            name=TOOL_NAME,
-                            args={"query": search_query},
-                            id=tool_call_id,
-                            type="tool_call",
-                        )
-                    ],
-                    additional_kwargs={
-                        "microchat_auto_search_for": search_key,
-                        "microchat_search_sources": sources,
-                    },
-                ),
-                ToolMessage(
-                    content=tool_content,
-                    name=TOOL_NAME,
-                    tool_call_id=tool_call_id,
-                    additional_kwargs={"microchat_hide_output": True},
-                ),
-            ],
-        }
+                    content="Je n'ai pas trouvé de résultat correspondant exactement à ce nom."
+                )
+            )
+            return {"messages": search_messages, "jump_to": "end"}
+        return {"messages": search_messages}
 
     return search_factual_question
 

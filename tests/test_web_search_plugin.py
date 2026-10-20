@@ -57,16 +57,89 @@ def test_search_terms_removes_question_prefix_and_punctuation():
     )
 
 
+@pytest.mark.parametrize(
+    "query",
+    ["C'est qui Brice Davoleau ?", "Qui est brice davoleau ?"],
+)
+def test_ddg_query_normalizes_equivalent_person_questions(query):
+    assert web_search._ddg_query(query) == '"brice davoleau"'
+
+
+def test_ddg_query_does_not_quote_broader_identity_questions():
+    assert web_search._ddg_query("Qui est le président de France ?") == "le président de france"
+
+
+def test_exact_person_search_rejects_homonymous_results():
+    results = web_search._clean_and_rank_results(
+        '"brice davoleau"',
+        [
+            {
+                "title": "Brice Davoli",
+                "href": "https://bricedavoli.com/",
+                "body": "Brice Davoli est un compositeur français.",
+            },
+            {
+                "title": "Brice Davoleau - Directeur agence",
+                "href": "https://fr.linkedin.com/in/brice-davoleau-9abab910",
+                "body": "Directeur agence de conseil et expertise.",
+            },
+        ],
+    )
+
+    assert [result["href"] for result in results] == [
+        "https://fr.linkedin.com/in/brice-davoleau-9abab910"
+    ]
+
+
+def test_exact_person_search_does_not_answer_from_a_homonym(monkeypatch):
+    monkeypatch.setattr(web_search, "_get_ddgs", lambda: object)
+    homonym_results = [
+        {
+            "title": "Brice Davoli",
+            "href": "https://bricedavoli.com/",
+            "body": "Brice Davoli est un compositeur et propriétaire d'une galerie.",
+        }
+    ]
+
+    def fake_fetch(query: str, **_kwargs: Any) -> list[dict[str, Any]]:
+        return web_search._clean_and_rank_results(query, homonym_results)
+
+    monkeypatch.setattr(web_search, "_fetch_results", fake_fetch)
+    plugin = web_search.load_plugin({})
+    agent = build_agent(
+        FakeMessagesListChatModel(
+            responses=[AIMessage(content="Brice Davoleau est un compositeur.")]
+        ),
+        system_prompt="Réponds en français.",
+        plugins=(plugin,),
+        token_counter=lambda messages: sum(
+            len(str(message.content).split()) for message in messages
+        ),
+        history_token_budget=1000,
+        history_low_watermark=0.6,
+        checkpointer=InMemorySaver(),
+    )
+
+    state = agent.invoke(
+        {"messages": [HumanMessage(content="qui est brice davoleau ?")]},
+        config={"configurable": {"thread_id": "exact-person-search"}},
+    )
+
+    assert state["messages"][-1].content == (
+        "Je n'ai pas trouvé de résultat correspondant exactement à ce nom."
+    )
+
+
 def test_pre_search_uses_model_and_appends_only_three_sources(monkeypatch):
     class FixedResponseModel(FakeMessagesListChatModel):
         def bind_tools(self, tools, *, tool_choice=None, **kwargs):
             return self
 
-    monkeypatch.setattr(web_search, "_get_ddgs", lambda: object)
-    monkeypatch.setattr(
-        web_search,
-        "_fetch_results",
-        lambda *_args, **_kwargs: [
+    search_queries: list[str] = []
+
+    def fake_fetch(query: str, **_kwargs: Any) -> list[dict[str, str]]:
+        search_queries.append(query)
+        return [
             {
                 "title": "Site officiel de Kandorya",
                 "href": "https://www.kandorya.net/",
@@ -75,8 +148,10 @@ def test_pre_search_uses_model_and_appends_only_three_sources(monkeypatch):
             {"title": "Source 2", "href": "https://example.com/2", "body": "Second excerpt."},
             {"title": "Source 3", "href": "https://example.com/3", "body": "Third excerpt."},
             {"title": "Source 4", "href": "https://example.com/4", "body": "Fourth excerpt."},
-        ],
-    )
+        ]
+
+    monkeypatch.setattr(web_search, "_get_ddgs", lambda: object)
+    monkeypatch.setattr(web_search, "_fetch_results", fake_fetch)
     plugin = web_search.load_plugin({})
     model = FixedResponseModel(
         responses=[AIMessage(content="Kandorya est un jeu de rôle grandeur nature.")]
@@ -109,6 +184,8 @@ def test_pre_search_uses_model_and_appends_only_three_sources(monkeypatch):
 
     state = agent.get_state(app._config()).values
     answer = state["messages"][-1].content
+    assert search_queries == ["kandorya"]
+    assert state["messages"][0].content == "c'est quoi Kandorya ?"
     assert answer.startswith("Kandorya est un jeu de rôle grandeur nature.")
     assert "Sources :" in answer
     assert "Site officiel de Kandorya — https://www.kandorya.net/" in answer
