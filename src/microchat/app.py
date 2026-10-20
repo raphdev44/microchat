@@ -26,9 +26,12 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.graph.state import CompiledStateGraph
+from rich.align import Align
+from rich.columns import Columns
 from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.table import Table
@@ -443,11 +446,50 @@ class ChatApp:
             artifact = message.artifact
             panel = artifact.get("microchat_panel") if isinstance(artifact, dict) else None
             if isinstance(panel, dict) and panel.get("kind") in ("card", "panel"):
+                tiles = panel.get("tiles")
+                body: RenderableType = Markdown(panel["body"])
+                panel_width = None
+                if tiles:
+                    weekly = panel["kind"] == "panel"
+                    tile_renderables: list[RenderableType] = [
+                        Align.center(Text.from_markup(tile), vertical="middle", height=3)
+                        for tile in tiles
+                    ]
+                    if weekly:
+                        tile_renderables = [Padding(tile, (1, 1)) for tile in tile_renderables]
+                        tile_width = max(
+                            self.console.measure(tile).maximum for tile in tile_renderables
+                        )
+                        column_count = min(
+                            len(tiles), max(1, (self.console.width - 3) // (tile_width + 1))
+                        )
+                        content_width = column_count * (tile_width + 1) - 1
+                        content_width = max(
+                            content_width,
+                            self.console.measure(Text(panel["title"])).maximum,
+                            *(self.console.measure(Text(note)).maximum
+                              for note in panel.get("notes", [])),
+                        )
+                        panel_width = min(self.console.width, content_width + 4)
+                    else:
+                        panel_width = min(self.console.width, 64)
+                    body = Group(
+                        Columns(
+                            tile_renderables,
+                            equal=weekly,
+                            expand=not weekly,
+                            padding=(0, 1),
+                        ),
+                        *(Text(note, style="dim") for note in panel.get("notes", [])),
+                    )
                 return Panel(
-                    Markdown(panel["body"]),
+                    body,
                     title=Text(panel["title"]),
+                    subtitle=Text(panel.get("subtitle", "°C")) if tiles else None,
                     border_style="cyan",
-                    expand=panel["kind"] == "panel",
+                    expand=not tiles and panel["kind"] == "panel",
+                    padding=(0, 1) if tiles and panel["kind"] == "panel" else (1, 1),
+                    width=panel_width,
                 )
             return Markdown(text) if text else spinner
 

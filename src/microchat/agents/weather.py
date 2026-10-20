@@ -30,6 +30,7 @@ from langchain_core.messages import (
 from langchain_core.tools import BaseTool, ToolException, tool
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, Field, field_validator
+from rich.markup import escape
 
 from microchat.agents.runtime import _parse_text_tool_calls as parse_text_tool_calls
 from microchat.agents.runtime import build_agent as build_runtime_agent
@@ -160,6 +161,11 @@ def _condition(code: Any) -> tuple[str, str]:
 def _num(value: Any) -> str:
     """Affiche une mesure Open-Meteo, qui peut être absente sur les jours lointains."""
     return "n/d" if value is None else str(value)
+
+
+def _compact_temperature(value: Any) -> str:
+    """Arrondit une température uniquement pour sa restitution compacte."""
+    return f"{value:.0f}°" if isinstance(value, (int, float)) else "n/d"
 
 
 def normalize_name(text: str) -> str:
@@ -382,6 +388,7 @@ def make_weather_tool(timeout_seconds: int) -> BaseTool:
                 f"💨 {_num(current.get('wind_speed_10m'))} km/h"
             )
         end = min(offset + days, len(dates))
+        tiles = []
         for index in range(offset, end):
 
             def value(name: str, i: int = index) -> Any:
@@ -434,6 +441,13 @@ def make_weather_tool(timeout_seconds: int) -> BaseTool:
                 rainfall = value("precipitation_sum")
                 probability = value("precipitation_probability_max")
                 wind = value("wind_speed_10m_max")
+                day_label = f"{_WEEKDAYS[dates[index].weekday()][:3]}. {dates[index].day}"
+                style = "bold cyan" if dates[index] == today else "bold"
+                tiles.append(
+                    f"[{style}]{day_label}[/]\n{symbol}\n"
+                    f"[bold]{escape(_compact_temperature(maximum))}[/] "
+                    f"[dim]{escape(_compact_temperature(minimum))}[/]"
+                )
             lines.append(
                 f"- **{heading}** : {symbol} {label}, "
                 f"🌡️ {_num(minimum)} → {_num(maximum)} °C, "
@@ -441,12 +455,33 @@ def make_weather_tool(timeout_seconds: int) -> BaseTool:
             )
         if offset + days > len(dates):
             lines += ["", f"_Prévisions limitées au {format_day(dates[-1])}._"]
+        single_day = end - offset == 1
+        if single_day:
+            temperature = (
+                f"{_compact_temperature(maximum)} / {_compact_temperature(minimum)}"
+            )
+            if offset == 0 and not hours and isinstance(current, dict):
+                temperature = _compact_temperature(current.get("temperature_2m"))
+                symbol, label = _condition(current.get("weather_code"))
+                wind = current.get("wind_speed_10m")
+            tiles = [
+                f"[bold cyan]{escape(temperature)}[/]",
+                f"{symbol}\n{escape(label.capitalize())}",
+                f"💨 {escape(_num(wind))} km/h",
+            ]
         content = "\n".join(lines)
         return content, {
             "microchat_panel": {
-                "kind": "card" if end - offset == 1 else "panel",
-                "title": f"Météo · {place}" if end - offset == 1 else f"Prévisions · {place}",
+                "kind": "card" if single_day else "panel",
+                "title": f"Météo · {place}" if single_day else f"Prévisions · {place}",
+                "subtitle": f"{heading} · °C" if single_day else "°C",
                 "body": "\n".join(lines[2:]),
+                "tiles": tiles,
+                "notes": (
+                    (["Localisation IP approximative."] if geolocated else [])
+                    + ([f"Prévisions limitées au {format_day(dates[-1])}."]
+                       if offset + days > len(dates) else [])
+                ),
             }
         }
 

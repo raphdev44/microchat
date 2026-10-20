@@ -149,7 +149,9 @@ def test_weather_tool_names_match_declared_tools():
     assert weather.make_weather_tool(timeout_seconds=1).name in weather.TOOL_NAMES
 
 
-@pytest.mark.parametrize("days,width", [(1, 100), (2, 100), (1, 40), (2, 40)])
+@pytest.mark.parametrize(
+    "days,width", [(1, 100), (2, 100), (1, 40), (2, 40), (7, 100), (7, 80), (7, 40), (7, 24)]
+)
 def test_chat_app_shows_weather_icon_when_subagent_is_used(monkeypatch, days, width):
     spinner_phases = []
     overflow_modes = []
@@ -190,13 +192,13 @@ def test_chat_app_shows_weather_icon_when_subagent_is_used(monkeypatch, days, wi
                         "wind_speed_10m": 12,
                     },
                     "daily": {
-                        "time": ["2026-10-19", "2026-10-20"],
-                        "weather_code": [61, 0],
-                        "temperature_2m_min": [9, 10],
-                        "temperature_2m_max": [15, 16],
-                        "precipitation_sum": [2.4, 0],
-                        "precipitation_probability_max": [70, 0],
-                        "wind_speed_10m_max": [20, 10],
+                        "time": [f"2026-10-{19 + index}" for index in range(7)],
+                        "weather_code": [61, 0, 2, 3, 61, 0, 2],
+                        "temperature_2m_min": [9.2, 10.3, 11.1, 9.2, 8.4, 7.1, 10.2],
+                        "temperature_2m_max": [15.4, 16.2, 17.1, 18.3, 14.2, 15.1, 16.4],
+                        "precipitation_sum": [2.4, 0, 0, 0, 1, 0, 0],
+                        "precipitation_probability_max": [70, 0, 0, 0, 60, 0, 0],
+                        "wind_speed_10m_max": [20, 10, 12, 14, 15, 10, 12],
                     },
                 }
             ).encode("utf-8")
@@ -238,9 +240,38 @@ def test_chat_app_shows_weather_icon_when_subagent_is_used(monkeypatch, days, wi
 
     rendered = output.getvalue()
     assert weather.ICON in rendered
-    assert "couvert" in rendered
-    assert "pluie" in rendered and "faible" in rendered
-    assert f"{'Météo' if days == 1 else 'Prévisions'} · Nantes" in rendered
+    if days == 1:
+        assert "Couvert" in rendered
+        assert "14°" in rendered
+        assert "12 km/h" in rendered
+        frame = next(line for line in rendered.splitlines() if "Météo · Nantes" in line)
+        assert cell_len(frame) <= min(width, 64)
+    else:
+        assert "lun. 19" in rendered
+        assert "mar. 20" in rendered
+        assert "15°" in rendered and "9°" in rendered
+        assert "15.4" not in rendered
+        assert "Maintenant" not in rendered
+        assert "km/h" not in rendered
+        assert "🌧️" in rendered
+        if days == 7:
+            labels = ["lun. 19", "mar. 20", "mer. 21", "jeu. 22", "ven. 23", "sam. 24", "dim. 25"]
+            assert all(label in rendered for label in labels)
+            if width >= 80:
+                headings = next(line for line in rendered.splitlines() if "lun. 19" in line)
+                assert all(label in headings for label in labels)
+    assert "humidité" not in rendered
+    assert "ressenti" not in rendered
+    assert " mm" not in rendered
+    title = f"{'Météo' if days == 1 else 'Prévisions'} · Nantes"
+    lines = rendered.splitlines()
+    frame_index = next(index for index, line in enumerate(lines) if title in line)
+    assert lines[frame_index + 1].strip("│ ") == ""
+    if days > 1 and width >= 80:
+        assert cell_len(lines[frame_index]) < width
+        headings = next(line for line in lines if "lun. 19" in line)
+        gap = headings.split("lun. 19", 1)[1].split("mar. 20", 1)[0]
+        assert len(gap) >= 3 and not gap.strip()
     assert any(corner in rendered for corner in ("╭", "┌"))
     assert max(cell_len(line) for line in rendered.splitlines()) <= width
     assert "Reformulation" not in rendered

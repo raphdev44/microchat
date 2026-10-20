@@ -147,6 +147,19 @@ def test_weather_tool_generates_serializable_display_artifact(monkeypatch, args,
     assert panel["title"].startswith(heading)
     assert "Nantes" in panel["title"]
     assert "°C" in panel["body"]
+    if kind == "card":
+        assert len(panel["tiles"]) == 3
+        if args:
+            assert "16° / 6°" in panel["tiles"][0]
+            assert "Pluie faible" in panel["tiles"][1]
+            assert "21 km/h" in panel["tiles"][2]
+            assert "Mardi 20 octobre" in panel["subtitle"]
+        else:
+            assert "17°" in panel["tiles"][0]
+            assert "Partiellement nuageux" in panel["tiles"][1]
+            assert "8 km/h" in panel["tiles"][2]
+    else:
+        assert len(panel["tiles"]) == 7
     json.dumps(result.artifact)
 
 

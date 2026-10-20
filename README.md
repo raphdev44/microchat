@@ -93,8 +93,13 @@ et peut correspondre à la sortie d'un VPN ou d'un proxy. Elle est signalée dan
 Si cette localisation échoue, le plugin demande une ville en conservant la période demandée.
 Une ville fournie explicitement évite tout appel au service de géolocalisation IP.
 
-Le tool produit directement une carte Rich pour un jour ou une partie de journée, et un
-panneau pour plusieurs jours. La restitution n'est jamais reformulée par le LLM.
+Le tool produit directement une carte Rich compacte pour un jour : température, symbole et
+état du ciel, vent. Pour aujourd'hui, il utilise les conditions actuelles ; pour une date
+future ou une partie de journée, les températures max/min et le vent prévus.
+Sur plusieurs jours, une bande affiche le jour, le symbole et les températures max/min de
+chaque journée. Les températures affichées sont arrondies au degré ; le jour courant est
+mis en évidence. Les colonnes se répartissent sur plusieurs rangées si le terminal est étroit.
+Les détails restent dans l'historique. La restitution n'est jamais reformulée par le LLM.
 
 La consultation nécessite Internet. Configurez son délai réseau dans `config.ini` :
 
