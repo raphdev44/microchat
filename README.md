@@ -138,6 +138,39 @@ max_results = 3
 désactiver seulement la recherche web, retirez `web_search` de la liste et conservez les
 autres plugins actifs.
 
+### Documents locaux (`rag`)
+
+Le plugin RAG indexe les fichiers texte, HTML, Markdown, DOCX, PPTX et PDF présents dans un
+fichier ou un dossier. Les vecteurs sont calculés localement avec FastEmbed; son premier usage
+télécharge le modèle `all-MiniLM-L6-v2`. L'index reste sur le disque, par défaut dans
+`~/.cache/microchat/rag/index.json`.
+
+Installez l'extra et activez le plugin dans `[microchat]` :
+
+```powershell
+python -m pip install -e ".[rag]"
+```
+
+```ini
+[microchat]
+plugins = weather, web_search, rag
+
+[plugin:rag]
+index_path = ~/.cache/microchat/rag/index.json
+max_results = 4
+chunk_size = 1200
+embedding_model = sentence-transformers/all-MiniLM-L6-v2
+```
+
+`embedding_model` accepte un nom de modèle pris en charge par FastEmbed; le même modèle doit
+rester configuré pour indexer et rechercher dans un index existant. `chunk_size` règle le nombre
+maximal de caractères par fragment; il doit être supérieur au chevauchement fixe de 150 caractères.
+Après modification, reconstruisez l'index avec `/rag_init`, puis `/rag_index`.
+
+Les commandes `/rag_index <fichier ou dossier>`, `/rag_init`, `/rag_start` et `/rag_stop`
+apparaissent dans `/help` uniquement lorsque `rag` est actif. `/rag_start` injecte les passages
+les plus pertinents dans chaque échange; `/rag_stop` revient au comportement normal.
+
 ### Ajouter un plugin
 
 Un plugin déclare un entry point dans le paquet Python qui le fournit :
@@ -161,9 +194,10 @@ src/microchat/
 ├── app.py             Configuration, modèle, interface et sessions
 ├── plugins.py         Contrat et découverte des plugins
 └── agents/
-    ├── runtime.py     Assemblage commun du chatbot et des plugins actifs
-    ├── weather.py     Plugin météo
-    └── web_search.py  Plugin DuckDuckGo
+    ├── runtime.py     Assemblage commun du chatbot
+    │   ├── weather.py     Plugin météo
+    │   ├── web_search.py  Plugin DuckDuckGo
+    │   └── rag.py         Indexation et recherche sémantique locale
 ```
 
 Le runtime commun gère l'historique et les appels d'outils des modèles locaux. Chaque plugin

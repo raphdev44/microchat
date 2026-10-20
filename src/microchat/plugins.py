@@ -19,9 +19,21 @@ class AgentPlugin:
     tools: Sequence[BaseTool]
     tool_icons: Mapping[str, str]
     middleware: Sequence[Any] = ()
+    commands: Mapping[str, PluginCommand] | None = None
+    context_provider: Callable[[], Sequence[tuple[str, str]]] | None = None
 
 
 PluginFactory = Callable[[Mapping[str, str]], AgentPlugin]
+
+
+@dataclass(frozen=True)
+class PluginCommand:
+    """Commande slash fournie par un plugin actif."""
+
+    usage: str
+    description: str
+    handler: Callable[[str], str]
+    icon: str = ""
 
 
 def load_plugins(

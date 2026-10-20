@@ -18,7 +18,7 @@ from microchat.agents import weather
 from microchat.agents.runtime import build_agent
 from microchat.agents.weather import build_agent as build_weather_agent
 from microchat.app import ChatApp, _parse_command, _select_gguf, load_config
-from microchat.plugins import AgentPlugin, load_plugins
+from microchat.plugins import AgentPlugin, PluginCommand, load_plugins
 
 
 class SimpleFakeModel(FakeMessagesListChatModel):
@@ -40,10 +40,12 @@ def test_loads_complete_ini_configuration():
     assert settings.n_ctx >= 512
     assert settings.history_token_budget > 0
     assert settings.session_id == "terminal"
-    assert settings.plugins == ("weather", "web_search")
+    assert settings.plugins == ("weather", "web_search", "rag")
     assert settings.plugin_configurations["weather"]["timeout_seconds"] == "30"
     assert settings.plugin_configurations["web_search"]["timeout_seconds"] == "5"
     assert settings.plugin_configurations["web_search"]["max_results"] == "3"
+    assert settings.plugin_configurations["rag"]["embedding_model"]
+    assert int(settings.plugin_configurations["rag"]["chunk_size"]) > 150
 
 
 def test_plugin_registry_accepts_no_active_plugins():
@@ -117,6 +119,43 @@ def test_parse_command(line, expected):
     assert _parse_command(line) == expected
 
 
+def test_plugin_commands_are_recognized_only_when_enabled():
+    assert _parse_command("/rag_start") == "unknown"
+    assert _parse_command("/rag_start", ("rag_start",)) == "rag_start"
+
+
+def test_help_shows_only_commands_from_active_plugins():
+    checkpointer = InMemorySaver()
+    agent = build_agent(
+        SimpleFakeModel(responses=[]),
+        system_prompt="Réponds brièvement.",
+        plugins=(),
+        token_counter=count_words,
+        history_token_budget=100,
+        history_low_watermark=0.6,
+        checkpointer=checkpointer,
+    )
+    settings = load_config(Path("config.ini"))
+    command = PluginCommand("/rag_start", "Active le mode RAG", lambda _argument: "ok", "📖")
+
+    def help_output(commands):
+        app = ChatApp(
+            agent,
+            checkpointer,
+            settings,
+            Path("fake.gguf"),
+            count_words,
+            plugin_commands=commands,
+        )
+        output = io.StringIO()
+        app.console = Console(file=output, force_terminal=False, width=100)
+        app._show_help()
+        return output.getvalue()
+
+    assert "/rag_start" not in help_output({})
+    assert "📖 /rag_start" in help_output({"rag_start": command})
+
+
 def test_chat_app_runs_chat_and_commands(monkeypatch):
     checkpointer = InMemorySaver()
     agent = build_agent(
@@ -143,6 +182,36 @@ def test_chat_app_runs_chat_and_commands(monkeypatch):
     assert "Messages en mémoire" in rendered
     assert "Historique effacé" in rendered
     assert app._message_count() == 0
+
+
+def test_retrieved_document_frames_render_before_the_answer():
+    checkpointer = InMemorySaver()
+    agent = build_agent(
+        SimpleFakeModel(responses=[AIMessage(content="Réponse finale")]),
+        system_prompt="Réponds brièvement.",
+        plugins=(),
+        token_counter=count_words,
+        history_token_budget=100,
+        history_low_watermark=0.6,
+        checkpointer=checkpointer,
+    )
+    app = ChatApp(
+        agent,
+        checkpointer,
+        load_config(Path("config.ini")),
+        Path("fake.gguf"),
+        count_words,
+        context_providers=(lambda: (("document.docx", "Fragment récupéré"),),),
+    )
+    output = io.StringIO()
+    app.console = Console(file=output, force_terminal=False, width=100)
+
+    app._answer("Question")
+
+    rendered = output.getvalue()
+    assert "Fragment documentaire" in rendered
+    assert "Fragment récupéré" in rendered
+    assert rendered.index("Fragment récupéré") < rendered.index("Réponse finale")
 
 
 def test_weather_tool_names_match_declared_tools():

@@ -10,6 +10,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
+from itertools import chain
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -40,7 +41,7 @@ from rich.text import Text
 from microchat import __version__
 from microchat.agents.runtime import build_agent as build_plugin_agent
 from microchat.agents.runtime import text_from_content, visible_text
-from microchat.plugins import load_plugins
+from microchat.plugins import PluginCommand, load_plugins
 
 logger = logging.getLogger(__name__)
 CONFIG_PATH = Path.cwd() / "config.ini"
@@ -299,7 +300,7 @@ def make_token_counter(llm: Any) -> Callable[[Sequence[BaseMessage]], int]:
     return count
 
 
-def _parse_command(line: str) -> str | None:
+def _parse_command(line: str, plugin_commands: Sequence[str] = ()) -> str | None:
     """Retourne une commande connue, ``unknown`` ou ``None`` si c'est un message."""
     if not line.startswith("/"):
         return None
@@ -315,6 +316,7 @@ def _parse_command(line: str) -> str | None:
         "exit": "quit",
         "q": "quit",
     }
+    aliases.update({name: name for name in plugin_commands})
     return aliases.get(name, "unknown")
 
 
@@ -329,6 +331,8 @@ class ChatApp:
         model_path: Path,
         token_counter: Callable[[Sequence[BaseMessage]], int],
         tool_icons: Mapping[str, str] | None = None,
+        plugin_commands: Mapping[str, PluginCommand] | None = None,
+        context_providers: Sequence[Callable[[], Sequence[tuple[str, str]]]] = (),
     ) -> None:
         self.agent = agent
         self.checkpointer = checkpointer
@@ -336,6 +340,8 @@ class ChatApp:
         self.model_path = model_path
         self.token_counter = token_counter
         self.tool_icons = dict(tool_icons or {})
+        self.plugin_commands = dict(plugin_commands or {})
+        self.context_providers = tuple(context_providers)
         self.console = Console()
         self.session_id = settings.session_id
 
@@ -369,7 +375,7 @@ class ChatApp:
             if not line:
                 continue
 
-            command = _parse_command(line)
+            command = _parse_command(line, tuple(self.plugin_commands))
             if command is None:
                 self._answer(line)
             elif command == "quit":
@@ -381,6 +387,12 @@ class ChatApp:
                 self.console.print("[dim]Historique effacé.[/]")
             elif command == "info":
                 self._show_info(info)
+            elif command in self.plugin_commands:
+                argument = line.partition(" ")[2].strip()
+                try:
+                    self.console.print(self.plugin_commands[command].handler(argument))
+                except (OSError, ValueError) as exc:
+                    self.console.print(Text(str(exc), style="yellow"))
             else:
                 self.console.print(
                     f"[yellow]Commande inconnue : {line.split()[0]} (essayez /help)[/]"
@@ -396,6 +408,9 @@ class ChatApp:
             ("/quit", "Quitte l'application (ou Ctrl+D)"),
         ):
             table.add_row(f"[cyan]{usage}[/]", description)
+        for command in self.plugin_commands.values():
+            usage = f"{command.icon} {command.usage}" if command.icon else command.usage
+            table.add_row(f"[cyan]{usage}[/]", command.description)
         self.console.print(Panel(table, title="Aide", border_style="blue", expand=False))
 
     def _show_info(self, info: dict[str, str]) -> None:
@@ -439,6 +454,19 @@ class ChatApp:
         tool_waiting = False
         icons: list[str] = []
 
+        def show_retrieved_context() -> None:
+            for provider in self.context_providers:
+                for source, fragment in provider():
+                    body = Text(f"{source}\n{fragment}", style="grey70")
+                    self.console.print(
+                        Panel(
+                            body,
+                            title=Text("Fragment documentaire", style="grey70"),
+                            border_style="grey50",
+                            expand=True,
+                        )
+                    )
+
         def render(body: RenderableType) -> RenderableType:
             return Group(Text(" ".join(icons)), body) if icons else body
 
@@ -467,8 +495,10 @@ class ChatApp:
                         content_width = max(
                             content_width,
                             self.console.measure(Text(panel["title"])).maximum,
-                            *(self.console.measure(Text(note)).maximum
-                              for note in panel.get("notes", [])),
+                            *(
+                                self.console.measure(Text(note)).maximum
+                                for note in panel.get("notes", [])
+                            ),
                         )
                         panel_width = min(self.console.width, content_width + 4)
                     else:
@@ -494,13 +524,16 @@ class ChatApp:
             return Markdown(text) if text else spinner
 
         try:
+            first_event = next(chunks, None)
+            show_retrieved_context()
             with Live(
                 spinner,
                 console=self.console,
                 refresh_per_second=self.settings.render_refresh_hz,
                 vertical_overflow="ellipsis",
             ) as live:
-                for chunk, _metadata in chunks:
+                events = chain((first_event,), chunks) if first_event is not None else chunks
+                for chunk, _metadata in events:
                     if isinstance(chunk, ToolMessage):
                         icon = self.tool_icons.get(chunk.name or "")
                         if icon and icon not in icons:
@@ -553,8 +586,11 @@ class ChatApp:
                     else ""
                 )
                 body = (
-                    tool_result(last, answer) if isinstance(last, ToolMessage)
-                    else Markdown(answer) if answer else Text("(réponse vide)")
+                    tool_result(last, answer)
+                    if isinstance(last, ToolMessage)
+                    else Markdown(answer)
+                    if answer
+                    else Text("(réponse vide)")
                 )
                 live.update(render(body))
         except (Exception, GeneratorExit, KeyboardInterrupt):
@@ -633,7 +669,22 @@ def run() -> int:
         tool_icons = {
             tool_name: icon for plugin in plugins for tool_name, icon in plugin.tool_icons.items()
         }
-        ChatApp(agent, checkpointer, settings, model_path, token_counter, tool_icons).run()
+        plugin_commands = {
+            name: command for plugin in plugins for name, command in (plugin.commands or {}).items()
+        }
+        context_providers = [
+            plugin.context_provider for plugin in plugins if plugin.context_provider is not None
+        ]
+        ChatApp(
+            agent,
+            checkpointer,
+            settings,
+            model_path,
+            token_counter,
+            tool_icons,
+            plugin_commands,
+            context_providers,
+        ).run()
     except (ValueError, RuntimeError, OSError, configparser.Error) as exc:
         print(f"Erreur : {exc}", file=sys.stderr)
         return 1
