@@ -456,6 +456,10 @@ class ChatApp:
                                 "dots", text=Text("Traitement du résultat…", style="dim")
                             )
                             live.update(render(spinner))
+                        if chunk.additional_kwargs.get("microchat_hide_output"):
+                            spinner = Spinner("dots", text=Text("Recherche web…", style="dim"))
+                            live.update(render(spinner))
+                            continue
                         result = visible_text("".join(text_from_content(chunk.content)))
                         live.update(render(Markdown(result) if result else spinner))
                         continue

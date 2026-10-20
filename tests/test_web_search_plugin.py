@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import io
+from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
 from langchain.agents.middleware.types import ModelRequest
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from pydantic import PrivateAttr
+from rich.console import Console
 
 from microchat.agents import weather, web_search
 from microchat.agents.runtime import build_agent
+from microchat.app import ChatApp, load_config
 
 
 def test_web_search_plugin_declares_tool_and_icon(monkeypatch):
@@ -20,7 +26,8 @@ def test_web_search_plugin_declares_tool_and_icon(monkeypatch):
     assert plugin.name == "web_search"
     assert plugin.tools[0].name == "search_web"
     assert plugin.tool_icons == {"search_web": web_search.ICON}
-    assert len(plugin.middleware) == 2
+    assert plugin.tool_icons == {"search_web": "🌐"}
+    assert len(plugin.middleware) == 3
 
 
 @pytest.mark.parametrize(
@@ -50,7 +57,7 @@ def test_search_terms_removes_question_prefix_and_punctuation():
     )
 
 
-def test_pre_search_returns_sources_without_calling_model(monkeypatch):
+def test_pre_search_uses_model_and_appends_only_three_sources(monkeypatch):
     class FixedResponseModel(FakeMessagesListChatModel):
         def bind_tools(self, tools, *, tool_choice=None, **kwargs):
             return self
@@ -64,11 +71,17 @@ def test_pre_search_returns_sources_without_calling_model(monkeypatch):
                 "title": "Site officiel de Kandorya",
                 "href": "https://www.kandorya.net/",
                 "body": "Un jeu de rôle grandeur nature en France.",
-            }
+            },
+            {"title": "Source 2", "href": "https://example.com/2", "body": "Second excerpt."},
+            {"title": "Source 3", "href": "https://example.com/3", "body": "Third excerpt."},
+            {"title": "Source 4", "href": "https://example.com/4", "body": "Fourth excerpt."},
         ],
     )
     plugin = web_search.load_plugin({})
-    model = FixedResponseModel(responses=[AIMessage(content="Réponse inventée du modèle")])
+    model = FixedResponseModel(
+        responses=[AIMessage(content="Kandorya est un jeu de rôle grandeur nature.")]
+    )
+    checkpointer = InMemorySaver()
     agent = build_agent(
         model,
         system_prompt="Réponds en français.",
@@ -78,30 +91,49 @@ def test_pre_search_returns_sources_without_calling_model(monkeypatch):
         ),
         history_token_budget=1000,
         history_low_watermark=0.6,
-        checkpointer=InMemorySaver(),
+        checkpointer=checkpointer,
     )
-
-    state = agent.invoke(
-        {"messages": [HumanMessage(content="c'est quoi Kandorya ?")]},
-        config={"configurable": {"thread_id": "web-search-test"}},
+    settings = replace(load_config(Path("config.ini")), session_id="web-search-test")
+    output = io.StringIO()
+    app = ChatApp(
+        agent,
+        checkpointer,
+        settings,
+        Path("fake.gguf"),
+        lambda messages: len(messages),
+        plugin.tool_icons,
     )
+    app.console = Console(file=output, force_terminal=False, width=120)
 
-    assert "Site officiel de Kandorya" in state["messages"][-1].content
-    assert "https://www.kandorya.net/" in state["messages"][-1].content
-    assert "Réponse inventée" not in state["messages"][-1].content
+    app._answer("c'est quoi Kandorya ?")
+
+    state = agent.get_state(app._config()).values
+    answer = state["messages"][-1].content
+    assert answer.startswith("Kandorya est un jeu de rôle grandeur nature.")
+    assert "Sources :" in answer
+    assert "Site officiel de Kandorya — https://www.kandorya.net/" in answer
+    assert "Source 2 — https://example.com/2" in answer
+    assert "Source 3 — https://example.com/3" in answer
+    assert "Source 4" not in answer
+    rendered = output.getvalue()
+    assert "Kandorya est un jeu de rôle grandeur nature." in rendered
+    assert "Sources :" in rendered
+    assert "Un jeu de rôle grandeur nature en France." not in rendered
+    assert "Second excerpt." not in rendered
 
 
 def test_model_does_not_receive_search_tool_for_greetings_or_weather(monkeypatch):
     monkeypatch.setattr(web_search, "_get_ddgs", lambda: object)
     search_plugin = web_search.load_plugin({})
     weather_plugin = weather.load_plugin({})
-    policy = search_plugin.middleware[-1]
+    policy = search_plugin.middleware[1]
     tools = [*search_plugin.tools, *weather_plugin.tools]
     exposed_tool_names = []
 
     for query in (
         "salut toi !",
         "Quel temps fait-il à Couëron ?",
+        "Qui est Ada Lovelace ?",
     ):
         message = HumanMessage(content=query)
         request = ModelRequest(
@@ -118,8 +150,167 @@ def test_model_does_not_receive_search_tool_for_greetings_or_weather(monkeypatch
             ),
         )
 
-    assert len(exposed_tool_names) == 2
-    assert exposed_tool_names == [["get_weather"], ["get_weather"]]
+    assert len(exposed_tool_names) == 3
+    assert exposed_tool_names == [["get_weather"], ["get_weather"], ["get_weather"]]
+
+
+def test_searched_answer_preserves_prior_messages(monkeypatch):
+    monkeypatch.setattr(web_search, "_get_ddgs", lambda: object)
+    plugin = web_search.load_plugin({})
+    policy = plugin.middleware[1]
+    prior_user = HumanMessage(content="ancienne question")
+    prior_answer = AIMessage(content="Ancien contexte à ne pas utiliser")
+    current_user = HumanMessage(content="Qui est cette personne ?", id="current-question")
+    search_call = AIMessage(
+        content=" ",
+        tool_calls=[
+            {"name": "search_web", "args": {"query": "Qui est cette personne"}, "id": "search-1"}
+        ],
+        additional_kwargs={"microchat_auto_search_for": "current-question"},
+    )
+    search_result = ToolMessage(
+        content="Résultats frais uniquement", name="search_web", tool_call_id="search-1"
+    )
+    session_messages = [prior_user, prior_answer, current_user, search_call, search_result]
+    system_prompt = "Instructions système conservées"
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[AIMessage(content="Réponse")]),
+        messages=session_messages,
+        system_prompt=system_prompt,
+        tools=list(plugin.tools),
+        state={"messages": session_messages},
+    )
+    model_inputs = []
+
+    policy.wrap_model_call(
+        request,
+        lambda updated: model_inputs.append(updated) or AIMessage(content="Réponse"),
+    )
+
+    assert model_inputs[0].messages == session_messages
+    assert model_inputs[0].system_prompt == system_prompt
+    assert request.state["messages"] == session_messages
+
+
+def test_follow_up_reuses_search_context_without_old_tool_messages(monkeypatch):
+    monkeypatch.setattr(web_search, "_get_ddgs", lambda: object)
+    plugin = web_search.load_plugin({})
+    policy = plugin.middleware[1]
+    previous_user = HumanMessage(content="c'est quoi Kandorya ?", id="question-1")
+    search_call = AIMessage(
+        content=" ",
+        tool_calls=[{"name": "search_web", "args": {"query": "Kandorya"}, "id": "search-1"}],
+        additional_kwargs={"microchat_auto_search_for": "question-1"},
+    )
+    search_result = ToolMessage(
+        content=(
+            "Question : c'est quoi Kandorya ?\n\nExtraits de recherche :\n"
+            "1. Kandorya\n   URL : https://example.com/kandorya\n"
+            "   Extrait : Kandorya se déroule près d'Angers."
+        ),
+        name="search_web",
+        tool_call_id="search-1",
+    )
+    previous_answer = AIMessage(
+        content="Kandorya est un jeu de rôle.\n\nSources :\n- Kandorya — https://example.com/kandorya",
+        additional_kwargs={"microchat_sources_for": "question-1"},
+    )
+    follow_up = HumanMessage(content="et c'est où ?", id="question-2")
+    messages = [previous_user, search_call, search_result, previous_answer, follow_up]
+    request = ModelRequest(
+        model=FakeMessagesListChatModel(responses=[AIMessage(content="Réponse")]),
+        messages=messages,
+        tools=list(plugin.tools),
+        state={"messages": messages},
+    )
+    captured = []
+
+    policy.wrap_model_call(
+        request,
+        lambda updated: captured.append(updated.messages) or AIMessage(content="Réponse"),
+    )
+
+    model_messages = captured[0]
+    assert not any(
+        isinstance(message, (ToolMessage,))
+        or (
+            isinstance(message, AIMessage)
+            and message.additional_kwargs.get("microchat_auto_search_for")
+        )
+        for message in model_messages
+    )
+    assert not any(
+        isinstance(message, AIMessage) and "Sources :" in str(message.content)
+        for message in model_messages
+    )
+    assert "Kandorya se déroule près d'Angers." in model_messages[-1].content
+    assert "Question : et c'est où ?" in model_messages[-1].content
+    assert request.messages == messages
+
+
+def test_langgraph_preserves_conversation_history_during_search(monkeypatch):
+    class CapturingModel(FakeMessagesListChatModel):
+        _model_inputs: list = PrivateAttr(default_factory=list)
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+
+        def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+            return self
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            self._model_inputs.append(messages)
+            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    monkeypatch.setattr(web_search, "_get_ddgs", lambda: object)
+    monkeypatch.setattr(
+        web_search,
+        "_fetch_results",
+        lambda *_args, **_kwargs: [
+            {
+                "title": "Ada Lovelace",
+                "href": "https://example.com/ada",
+                "body": "Ada Lovelace était une mathématicienne britannique.",
+            }
+        ],
+    )
+    plugin = web_search.load_plugin({})
+    model = CapturingModel(
+        responses=[
+            AIMessage(content="Ancien contexte de conversation."),
+            AIMessage(content="Ada Lovelace était une mathématicienne."),
+        ]
+    )
+    agent = build_agent(
+        model,
+        system_prompt="Réponds en français.",
+        plugins=(plugin,),
+        token_counter=lambda messages: sum(
+            len(str(message.content).split()) for message in messages
+        ),
+        history_token_budget=1000,
+        history_low_watermark=0.6,
+        checkpointer=InMemorySaver(),
+    )
+    config = {"configurable": {"thread_id": "search-history-isolation"}}
+
+    agent.invoke({"messages": [HumanMessage(content="Bonjour")]}, config=config)
+    agent.invoke({"messages": [HumanMessage(content="Qui est Ada Lovelace ?")]}, config=config)
+
+    search_prompt = model._model_inputs[1]
+    assert any(
+        isinstance(message, HumanMessage) and message.content == "Qui est Ada Lovelace ?"
+        for message in search_prompt
+    )
+    assert any(
+        isinstance(message, ToolMessage)
+        and "Ada Lovelace était une mathématicienne britannique." in message.content
+        for message in search_prompt
+    )
+    assert any(
+        isinstance(message, AIMessage) and message.content == "Ancien contexte de conversation."
+        for message in search_prompt
+    )
 
 
 def test_web_search_plugin_requires_optional_dependency(monkeypatch):
@@ -137,7 +328,7 @@ def test_web_search_plugin_requires_optional_dependency(monkeypatch):
     [
         ({"timeout_seconds": "invalid"}, "doivent être entiers"),
         ({"timeout_seconds": "0"}, "timeout_seconds doit être supérieur"),
-        ({"max_results": "11"}, "max_results doit être compris"),
+        ({"max_results": "4"}, "max_results doit être compris"),
         ({"region": " "}, "region ne peut pas être vide"),
     ],
 )
@@ -175,7 +366,7 @@ def test_fetch_results_passes_search_settings_to_ddgs(monkeypatch):
         "query": "current question",
         "region": "fr-fr",
         "safesearch": "moderate",
-        "max_results": 4,
+        "max_results": 3,
         "backend": "auto",
     }
 
@@ -285,3 +476,20 @@ def test_format_results_accepts_alternate_result_keys():
 
     assert "https://example.com" in result
     assert "Text" in result
+
+
+def test_format_sources_keeps_malformed_long_titles_from_merging_results():
+    results = [
+        {
+            "title": "Premier titre — Deuxième titre — " + "Autre résultat " * 20,
+            "href": "https://www.example.com/one",
+        },
+        {"title": "Source distincte", "href": "https://second.example.org/page"},
+    ]
+
+    sources = web_search._format_sources(results)
+
+    assert sources == [
+        {"title": "example.com", "url": "https://www.example.com/one"},
+        {"title": "Source distincte", "url": "https://second.example.org/page"},
+    ]

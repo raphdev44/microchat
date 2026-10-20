@@ -22,6 +22,7 @@ from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     HumanMessage,
+    SystemMessage,
     ToolCall,
 )
 from langchain_core.tools import BaseTool, ToolException, tool
@@ -436,11 +437,19 @@ def _make_weather_policy_middleware() -> Any:
                     tool_choice={"type": "function", "function": {"name": TOOL_NAMES[0]}}
                 )
         else:
-            request = request.override(
-                tools=[
+            overrides: dict[str, Any] = {
+                "tools": [
                     item for item in request.tools if getattr(item, "name", None) not in TOOL_NAMES
                 ]
-            )
+            }
+            if request.system_prompt and INSTRUCTIONS in request.system_prompt:
+                cleaned_prompt = "\n\n".join(
+                    part
+                    for part in request.system_prompt.split("\n\n")
+                    if part.strip() != INSTRUCTIONS.strip()
+                )
+                overrides["system_message"] = SystemMessage(content=cleaned_prompt)
+            request = request.override(**overrides)
         return handler(request)
 
     return route_weather_tool

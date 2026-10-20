@@ -42,7 +42,7 @@ def test_loads_complete_ini_configuration():
     assert settings.plugins == ("weather", "web_search")
     assert settings.plugin_configurations["weather"]["timeout_seconds"] == "30"
     assert settings.plugin_configurations["web_search"]["timeout_seconds"] == "5"
-    assert settings.plugin_configurations["web_search"]["max_results"] == "5"
+    assert settings.plugin_configurations["web_search"]["max_results"] == "3"
 
 
 def test_plugin_registry_accepts_no_active_plugins():

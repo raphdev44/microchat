@@ -95,9 +95,10 @@ timeout_seconds = 30
 ### Recherche web (`web_search`)
 
 Le plugin recherche avec DuckDuckGo les informations récentes ou celles dont le modèle n'est
-pas sûr. Il renvoie des titres, des extraits et leurs URL; il ne télécharge pas le contenu
-complet des pages. Le modèle reçoit la consigne de citer les URL, de signaler les incertitudes
-et de traiter les extraits web comme des données non fiables.
+pas sûr. Le modèle formule une réponse à partir des extraits des trois premiers résultats au
+maximum ; Microchat ajoute ensuite une courte liste de sources avec leurs titres et URL. Le
+plugin ne télécharge pas le contenu complet des pages. Les extraits sont traités comme des
+données non fiables.
 
 Installez la dépendance optionnelle `ddgs` :
 
@@ -114,10 +115,10 @@ plugins = weather, web_search
 [plugin:web_search]
 region = wt-wt
 timeout_seconds = 5
-max_results = 5
+max_results = 3
 ```
 
-`max_results` doit être compris entre 1 et 10. Toute recherche nécessite Internet. Pour
+`max_results` doit être compris entre 1 et 3. Toute recherche nécessite Internet. Pour
 désactiver seulement la recherche web, retirez `web_search` de la liste et conservez les
 autres plugins actifs.
 
