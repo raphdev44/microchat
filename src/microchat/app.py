@@ -439,6 +439,18 @@ class ChatApp:
         def render(body: RenderableType) -> RenderableType:
             return Group(Text(" ".join(icons)), body) if icons else body
 
+        def tool_result(message: ToolMessage, text: str) -> RenderableType:
+            artifact = message.artifact
+            panel = artifact.get("microchat_panel") if isinstance(artifact, dict) else None
+            if isinstance(panel, dict) and panel.get("kind") in ("card", "panel"):
+                return Panel(
+                    Markdown(panel["body"]),
+                    title=Text(panel["title"]),
+                    border_style="cyan",
+                    expand=panel["kind"] == "panel",
+                )
+            return Markdown(text) if text else spinner
+
         try:
             with Live(
                 spinner,
@@ -461,7 +473,7 @@ class ChatApp:
                             live.update(render(spinner))
                             continue
                         result = visible_text("".join(text_from_content(chunk.content)))
-                        live.update(render(Markdown(result) if result else spinner))
+                        live.update(render(tool_result(chunk, result)))
                         continue
                     if not isinstance(chunk, (AIMessage, AIMessageChunk)):
                         continue
@@ -498,7 +510,11 @@ class ChatApp:
                     if isinstance(last, (AIMessage, ToolMessage))
                     else ""
                 )
-                live.update(render(Markdown(answer) if answer else Text("(réponse vide)")))
+                body = (
+                    tool_result(last, answer) if isinstance(last, ToolMessage)
+                    else Markdown(answer) if answer else Text("(réponse vide)")
+                )
+                live.update(render(body))
         except (Exception, GeneratorExit, KeyboardInterrupt):
             current = self.agent.get_state(config).values.get("messages", [])
             if current != previous:

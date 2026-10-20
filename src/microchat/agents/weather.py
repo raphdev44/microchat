@@ -1,4 +1,4 @@
-"""Plugin météo : instructions, outil Open-Meteo et règle de ville obligatoire."""
+"""Plugin météo : localisation, prévisions Open-Meteo et restitution directe."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import date, timedelta
+from math import isfinite
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -24,6 +25,7 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
     ToolCall,
+    ToolMessage,
 )
 from langchain_core.tools import BaseTool, ToolException, tool
 from langgraph.runtime import Runtime
@@ -41,12 +43,16 @@ TOOL_NAMES = ("get_weather",)
 MAX_FORECAST_DAYS = 16
 ASK_CITY = "Pour quelle ville voulez-vous la météo ?"
 INSTRUCTIONS = (
-    "UTILISE IMPÉRATIVEMENT L'OUTIL 'get_weather' dès qu'une ville est mentionnée pour la météo. "
-    "Si l'utilisateur n'a cité aucune ville, demande-lui laquelle au lieu d'en choisir une. "
+    "UTILISE IMPÉRATIVEMENT L'OUTIL 'get_weather' pour toute question météo, "
+    "pluie, chaud ou froid. "
+    "Si l'utilisateur n'a cité aucune ville, omets 'city' : l'outil tente une géolocalisation. "
+    "N'invente jamais de ville. "
     "N'écris JAMAIS de texte expliquant que tu vas appeler l'outil : déclenche l'appel d'outil "
     "directement. Pour une date, recopie dans 'when' l'expression de l'utilisateur telle quelle "
-    "(demain, samedi, le 21…) sans la convertir. Pour plusieurs jours (« sur 3 jours », "
-    "« cette semaine »), indique le nombre de jours dans 'days'. Le résultat de l'outil est "
+    "(demain, samedi, le 21…, cet après-midi, cette semaine) sans la convertir. "
+    "Conserve les parties de journée dans 'when', par exemple demain après-midi. "
+    "Pour une durée explicite (« sur 3 jours »), indique le nombre de jours dans 'days'. "
+    "Pour cette semaine, passe 'cette semaine' dans 'when'. Le résultat de l'outil est "
     "affiché tel quel à l'utilisateur."
 )
 
@@ -54,9 +60,10 @@ INSTRUCTIONS = (
 class WeatherQuery(BaseModel):
     """Entrée contrôlée de l'outil météo."""
 
-    city: str = Field(
+    city: str | None = Field(
+        default=None,
         min_length=1,
-        description="Nom de la ville, par exemple Paris ou Montréal.",
+        description="Ville explicitement citée ; sinon omettre pour tenter la localisation IP.",
     )
     when: str | None = Field(
         default=None,
@@ -74,8 +81,10 @@ class WeatherQuery(BaseModel):
 
     @field_validator("city")
     @classmethod
-    def city_not_blank(cls, value: str) -> str:
+    def city_not_blank(cls, value: str | None) -> str | None:
         """Refuse les noms vides ou composés uniquement d'espaces."""
+        if value is None:
+            return None
         city = value.strip()
         if not city:
             raise ValueError("Le nom de la ville ne peut pas être vide.")
@@ -131,6 +140,7 @@ _DAY_PATTERN = re.compile(r"(?<!\d)(\d{1,2})(?:[/.-](\d{1,2}))?(?:[/.-](\d{4}))?
 _WEATHER_REQUEST = re.compile(
     r"\b(?:m[eé]t[eé]o|(?:il\s+fait\s+)?quel\s+temps\b|temps\s+qu['’]il\s+(?:fait|fera|va\s+faire)|"
     r"temp[eé]rature\b|pleut(?:-il)?\b|pleuvoir\b|neige(?:r)?\b|orage\b|"
+    r"(?:faire|fera(?:-t-il)?|fait(?:-il)?)\s+(?:chaud|froid|frais|beau)\b|"
     r"pr[eé]visions?\s+m[eé]t[eé]o)\b",
     re.IGNORECASE,
 )
@@ -187,6 +197,13 @@ def _next_matching_date(today: date, day: int, month: int | None, year: int | No
 def resolve_day(when: str | None, today: date) -> date:
     """Convertit une expression de date française en date, relative au jour local."""
     text = " ".join((when or "").lower().replace("’", "'").split())
+    if normalize_name(text) in (
+        "du jour", "ce matin", "cet apres midi", "ce soir", "cette nuit", "cette semaine"
+    ):
+        return today
+    text = re.sub(
+        r"\s+(?:matin|apr[eè]s[- ]midi|soir|nuit)$", "", text
+    )
     if text in ("", "aujourd'hui", "aujourdhui", "maintenant", "actuellement", "ce jour") or (
         re.fullmatch(r"(?:sur\s+)?\d+\s+jours?", text) is not None
     ):
@@ -253,37 +270,73 @@ def make_weather_tool(timeout_seconds: int) -> BaseTool:
             raise ToolException("Le service météo a renvoyé une réponse invalide.")
         return result
 
-    @tool(args_schema=WeatherQuery, return_direct=True)
-    def get_weather(city: str, when: str | None = None, days: int = 1) -> str:
-        """Donne la météo actuelle et les prévisions jour par jour d'une ville (16 jours max).
+    @tool(args_schema=WeatherQuery, return_direct=True, response_format="content_and_artifact")
+    def get_weather(
+        city: str | None = None, when: str | None = None, days: int = 1
+    ) -> tuple[str, dict[str, Any]]:
+        """Donne la météo locale ou d'une ville, par jour ou partie de journée (16 jours max).
 
-        Passe la date telle que l'utilisateur l'a dite dans `when` (demain, samedi, le 21…)
-        et le nombre de jours demandés dans `days`.
+        Omet `city` sans ville explicite. Passe la période telle quelle dans `when`
+        (demain, jeudi, cet après-midi, cette semaine), et la durée explicite dans `days`.
         """
-        location_result = get_json(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            {"name": city, "count": "1", "language": "fr", "format": "json"},
+        geolocated = city is None
+        if city is None:
+            try:
+                detected = get_json("https://ipapi.co/json/", {})
+                latitude = float(detected["latitude"])
+                longitude = float(detected["longitude"])
+                if not (
+                    isfinite(latitude) and -90 <= latitude <= 90
+                    and isfinite(longitude) and -180 <= longitude <= 180
+                ):
+                    raise ValueError("Coordonnées invalides")
+                location = {
+                    "name": detected.get("city") or "Position estimée",
+                    "admin1": detected.get("region"),
+                    "country": detected.get("country_name"),
+                    "latitude": latitude,
+                    "longitude": longitude,
+                }
+            except (ToolException, KeyError, TypeError, ValueError):
+                return ASK_CITY, {"pending_weather": {"when": when, "days": days}}
+        else:
+            location_result = get_json(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                {"name": city, "count": "1", "language": "fr", "format": "json"},
+            )
+            locations = location_result.get("results")
+            if not isinstance(locations, list) or not locations:
+                raise ToolException(f"Aucune ville trouvée pour « {city} ».")
+            location = locations[0]
+        period = normalize_name(when or "")
+        hours = next(
+            ((label, bounds) for label, bounds in (
+                ("matin", (6, 12)), ("apres midi", (12, 18)),
+                ("soir", (18, 24)), ("nuit", (0, 6)),
+            ) if label in period),
+            None,
         )
-        locations = location_result.get("results")
-        if not isinstance(locations, list) or not locations:
-            raise ToolException(f"Aucune ville trouvée pour « {city} ».")
-        location = locations[0]
+        params = {
+            "latitude": str(location["latitude"]),
+            "longitude": str(location["longitude"]),
+            "current": (
+                "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                "precipitation,weather_code,wind_speed_10m"
+            ),
+            "daily": (
+                "weather_code,temperature_2m_max,temperature_2m_min,"
+                "precipitation_sum,precipitation_probability_max,wind_speed_10m_max"
+            ),
+            "forecast_days": str(MAX_FORECAST_DAYS),
+            "timezone": "auto",
+        }
+        if hours:
+            params["hourly"] = (
+                "temperature_2m,precipitation,precipitation_probability,weather_code,wind_speed_10m"
+            )
         forecast = get_json(
             "https://api.open-meteo.com/v1/forecast",
-            {
-                "latitude": str(location["latitude"]),
-                "longitude": str(location["longitude"]),
-                "current": (
-                    "temperature_2m,relative_humidity_2m,apparent_temperature,"
-                    "precipitation,weather_code,wind_speed_10m"
-                ),
-                "daily": (
-                    "weather_code,temperature_2m_max,temperature_2m_min,"
-                    "precipitation_sum,precipitation_probability_max,wind_speed_10m_max"
-                ),
-                "forecast_days": str(MAX_FORECAST_DAYS),
-                "timezone": "auto",
-            },
+            params,
         )
         daily = forecast.get("daily")
         if not isinstance(daily, dict) or not daily.get("time"):
@@ -292,6 +345,8 @@ def make_weather_tool(timeout_seconds: int) -> BaseTool:
         # Le premier jour renvoyé est la date locale de la ville (timezone=auto).
         today = dates[0]
         start = resolve_day(when, today)
+        if period == "cette semaine":
+            days = 7 - today.weekday()
         offset = (start - today).days
         if offset < 0:
             raise ToolException(
@@ -313,8 +368,10 @@ def make_weather_tool(timeout_seconds: int) -> BaseTool:
             if part
         )
         lines = [f"**📍 {place}**", ""]
+        if geolocated:
+            lines.extend(["_Localisation IP approximative._", ""])
         current = forecast.get("current")
-        if offset == 0 and isinstance(current, dict):
+        if offset == 0 and not hours and isinstance(current, dict):
             symbol, label = _condition(current.get("weather_code"))
             lines.append(
                 f"- **Maintenant** : {symbol} {label}, "
@@ -331,49 +388,106 @@ def make_weather_tool(timeout_seconds: int) -> BaseTool:
                 series = daily.get(name)
                 return series[i] if isinstance(series, list) and i < len(series) else None
 
-            symbol, label = _condition(value("weather_code"))
+            heading = format_day(dates[index]).capitalize()
+            if hours:
+                hourly = forecast.get("hourly", {})
+                if not isinstance(hourly, dict):
+                    hourly = {}
+                indices = [
+                    position for position, stamp in enumerate(hourly.get("time", []))
+                    if stamp[:10] == dates[index].isoformat()
+                    and hours[1][0] <= int(stamp[11:13]) < hours[1][1]
+                ]
+                if not indices:
+                    raise ToolException("Prévisions horaires indisponibles pour cette période.")
+
+                measurements = {
+                    name: [
+                        series[position] for position in indices
+                        if position < len(series) and isinstance(series[position], (int, float))
+                    ]
+                    for name in (
+                        "temperature_2m", "precipitation", "precipitation_probability",
+                        "wind_speed_10m", "weather_code",
+                    )
+                    if isinstance(series := hourly.get(name), list)
+                }
+                temperatures = measurements.get("temperature_2m", [])
+                precipitation = measurements.get("precipitation", [])
+                probabilities = measurements.get("precipitation_probability", [])
+                winds = measurements.get("wind_speed_10m", [])
+                codes = measurements.get("weather_code", [])
+                code = codes[precipitation.index(max(precipitation))] if (
+                    codes and len(codes) == len(precipitation)
+                ) else (codes[0] if codes else None)
+                symbol, label = _condition(code)
+                period_label = {"apres midi": "après-midi"}.get(hours[0], hours[0])
+                heading += f" · {period_label} ({hours[1][0]} h–{hours[1][1]} h)"
+                minimum = min(temperatures) if temperatures else None
+                maximum = max(temperatures) if temperatures else None
+                rainfall = round(sum(precipitation), 2) if precipitation else None
+                probability = max(probabilities) if probabilities else None
+                wind = max(winds) if winds else None
+            else:
+                symbol, label = _condition(value("weather_code"))
+                minimum, maximum = value("temperature_2m_min"), value("temperature_2m_max")
+                rainfall = value("precipitation_sum")
+                probability = value("precipitation_probability_max")
+                wind = value("wind_speed_10m_max")
             lines.append(
-                f"- **{format_day(dates[index]).capitalize()}** : {symbol} {label}, "
-                f"🌡️ {_num(value('temperature_2m_min'))} → "
-                f"{_num(value('temperature_2m_max'))} °C, "
-                f"☔ {_num(value('precipitation_sum'))} mm "
-                f"({_num(value('precipitation_probability_max'))} %), "
-                f"💨 {_num(value('wind_speed_10m_max'))} km/h"
+                f"- **{heading}** : {symbol} {label}, "
+                f"🌡️ {_num(minimum)} → {_num(maximum)} °C, "
+                f"☔ {_num(rainfall)} mm ({_num(probability)} %), 💨 {_num(wind)} km/h"
             )
         if offset + days > len(dates):
             lines += ["", f"_Prévisions limitées au {format_day(dates[-1])}._"]
-        return "\n".join(lines)
+        content = "\n".join(lines)
+        return content, {
+            "microchat_panel": {
+                "kind": "card" if end - offset == 1 else "panel",
+                "title": f"Météo · {place}" if end - offset == 1 else f"Prévisions · {place}",
+                "body": "\n".join(lines[2:]),
+            }
+        }
 
     get_weather.handle_tool_error = True
     return get_weather
 
 
+def _pending_weather(messages: Sequence[BaseMessage]) -> dict[str, Any] | None:
+    """Retrouve la période en attente après un échec de géolocalisation."""
+    previous = next(
+        (item for item in reversed(messages) if isinstance(item, (AIMessage, ToolMessage))),
+        None,
+    )
+    if isinstance(previous, ToolMessage) and previous.content == ASK_CITY:
+        artifact = previous.artifact
+        if isinstance(artifact, dict) and isinstance(artifact.get("pending_weather"), dict):
+            return artifact["pending_weather"]
+    return None
+
+
 def _make_weather_middleware() -> Any:
-    """Crée le contrôle météo qui demande une ville avant l'appel réseau."""
+    """Empêche une ville inventée et reprend une localisation après échec IP."""
 
     @after_model
-    def require_named_city(
+    def ground_weather_location(
         state: AgentState, runtime: Runtime[None]
     ) -> dict[str, list[BaseMessage]] | None:
-        """Demande la ville et préserve la date lorsqu'elle est fournie au tour suivant."""
+        """Garde une ville explicite ou laisse l'outil tenter la localisation IP."""
         message = state["messages"][-1]
         if not isinstance(message, AIMessage):
             return None
 
         messages = state["messages"]
-        previous_assistant = next(
-            (item for item in reversed(messages[:-1]) if isinstance(item, AIMessage)), None
-        )
         latest_user = next(
             (item for item in reversed(messages[:-1]) if isinstance(item, HumanMessage)), None
         )
-        pending = (
-            previous_assistant.additional_kwargs.get("pending_weather")
-            if previous_assistant is not None and previous_assistant.content == ASK_CITY
-            else None
-        )
+        pending = _pending_weather(messages[:-1])
 
-        if pending and latest_user is not None:
+        if pending and latest_user is not None and not is_weather_request(
+            " ".join(text_from_content(latest_user.content))
+        ):
             city = "".join(text_from_content(latest_user.content)).strip()
             city = re.sub(r"^(?:à|a|au|aux|pour)\s+", "", city, flags=re.IGNORECASE)
             if city:
@@ -390,25 +504,19 @@ def _make_weather_middleware() -> Any:
         said = ""
         if latest_user is not None:
             said = f" {normalize_name(''.join(text_from_content(latest_user.content)))} "
+        calls = []
+        changed = False
         for call in message.tool_calls:
             city = normalize_name(str(call["args"].get("city", "")))
-            if call["name"] in TOOL_NAMES and (not city or f" {city} " not in said):
-                pending = {
-                    "when": call["args"].get("when"),
-                    "days": call["args"].get("days", 1),
-                }
-                return {
-                    "messages": [
-                        AIMessage(
-                            content=ASK_CITY,
-                            additional_kwargs={"pending_weather": pending},
-                            id=message.id,
-                        )
-                    ]
-                }
+            if call["name"] in TOOL_NAMES and city and f" {city} " not in said:
+                call = {**call, "args": {**call["args"], "city": None}}
+                changed = True
+            calls.append(call)
+        if changed:
+            return {"messages": [message.model_copy(update={"tool_calls": calls})]}
         return None
 
-    return require_named_city
+    return ground_weather_location
 
 
 def _make_weather_policy_middleware() -> Any:
@@ -421,15 +529,7 @@ def _make_weather_policy_middleware() -> Any:
             (message for message in reversed(messages) if isinstance(message, HumanMessage)),
             None,
         )
-        previous_assistant = next(
-            (item for item in reversed(messages) if isinstance(item, AIMessage)),
-            None,
-        )
-        pending = (
-            previous_assistant is not None
-            and previous_assistant.content == ASK_CITY
-            and bool(previous_assistant.additional_kwargs.get("pending_weather"))
-        )
+        pending = _pending_weather(messages)
         query = " ".join(text_from_content(user_message.content)).strip() if user_message else ""
         if pending or is_weather_request(query):
             if any(getattr(item, "name", None) == TOOL_NAMES[0] for item in request.tools):

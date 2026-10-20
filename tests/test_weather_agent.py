@@ -49,7 +49,15 @@ def open_meteo(location, requests=None, current_code=2):
     def fake_urlopen(request, timeout):
         if requests is not None:
             requests.append((request.full_url, timeout))
-        if "geocoding" in request.full_url:
+        if "ipapi.co" in request.full_url:
+            data = {
+                "city": location["name"],
+                "latitude": location["latitude"],
+                "longitude": location["longitude"],
+                "region": location.get("admin1"),
+                "country_name": location.get("country"),
+            }
+        elif "geocoding" in request.full_url:
             data = {"results": [location]}
         else:
             days = range(16)
@@ -121,6 +129,84 @@ def test_weather_tool_gives_future_day_and_multi_day_forecast(monkeypatch):
     assert "❄️ neige modérée" in three_days
 
 
+@pytest.mark.parametrize(
+    ("args", "kind", "heading"),
+    [({}, "card", "Météo"), ({"when": "demain"}, "card", "Météo"),
+     ({"when": "cette semaine"}, "panel", "Prévisions")],
+)
+def test_weather_tool_generates_serializable_display_artifact(monkeypatch, args, kind, heading):
+    monkeypatch.setattr("microchat.agents.weather.urlopen", open_meteo(NANTES))
+    result = make_weather_tool(5).invoke({
+        "name": "get_weather", "args": {"city": "Nantes", **args},
+        "id": "display", "type": "tool_call",
+    })
+
+    assert isinstance(result, ToolMessage)
+    panel = result.artifact["microchat_panel"]
+    assert panel["kind"] == kind
+    assert panel["title"].startswith(heading)
+    assert "Nantes" in panel["title"]
+    assert "°C" in panel["body"]
+    json.dumps(result.artifact)
+
+
+def test_weather_tool_limits_this_week_to_sunday(monkeypatch):
+    monkeypatch.setattr("microchat.agents.weather.urlopen", open_meteo(NANTES))
+    result = make_weather_tool(5).invoke({"city": "Nantes", "when": "cette semaine"})
+    assert "Dimanche 25 octobre" in result
+    assert "Lundi 26 octobre" not in result
+    assert result.count("- **") == 8
+
+
+@pytest.mark.parametrize("when,day_offset", [("cet après-midi", 0), ("demain après-midi", 1)])
+def test_weather_tool_uses_only_requested_afternoon_hours(monkeypatch, when, day_offset):
+    requests = []
+    successful = open_meteo(NANTES, requests)
+
+    def with_hourly(request, timeout):
+        response = successful(request, timeout)
+        data = json.load(response)
+        if "forecast" in request.full_url:
+            hours = range(48)
+            data["hourly"] = {
+                "time": [
+                    f"{(TODAY + timedelta(days=hour // 24)).isoformat()}T{hour % 24:02d}:00"
+                    for hour in hours
+                ],
+                "temperature_2m": [hour % 24 for hour in hours],
+                "precipitation": [0.5 if 12 <= hour % 24 < 18 else 10 for hour in hours],
+                "precipitation_probability": [40 for _ in hours],
+                "weather_code": [61 for _ in hours],
+                "wind_speed_10m": [15 for _ in hours],
+            }
+        return io.BytesIO(json.dumps(data).encode("utf-8"))
+
+    monkeypatch.setattr("microchat.agents.weather.urlopen", with_hourly)
+    result = make_weather_tool(5).invoke({"city": "Nantes", "when": when})
+
+    assert format_day(TODAY + timedelta(days=day_offset)).capitalize() in result
+    assert "après-midi (12 h–18 h)" in result
+    assert "12 → 17 °C" in result
+    assert "3.0 mm (40 %)" in result
+    assert "Maintenant" not in result
+    assert "hourly=" in requests[-1][0]
+
+
+def test_weather_tool_reports_missing_hourly_data_without_using_daily_totals(monkeypatch):
+    monkeypatch.setattr("microchat.agents.weather.urlopen", open_meteo(NANTES))
+    result = make_weather_tool(5).invoke({"city": "Nantes", "when": "cet après-midi"})
+    assert "Prévisions horaires indisponibles" in result
+    assert "mm" not in result
+
+
+@pytest.mark.parametrize("location", [b'{"error": true}', b'{"latitude": 200,"longitude": 0}'])
+def test_weather_tool_requests_city_when_ip_location_is_unavailable(monkeypatch, location):
+    monkeypatch.setattr(
+        "microchat.agents.weather.urlopen", lambda request, timeout: io.BytesIO(location)
+    )
+    assert make_weather_tool(5).invoke({}) == ASK_CITY
+
+
 def test_weather_tool_reports_dates_outside_forecast_to_model(monkeypatch):
     monkeypatch.setattr("microchat.agents.weather.urlopen", open_meteo(NANTES))
     weather_tool = make_weather_tool(timeout_seconds=7)
@@ -186,6 +272,35 @@ def test_resolve_day_rolls_over_to_next_year():
 def test_resolve_day_rejects_unknown_expression():
     with pytest.raises(ToolException, match="Date non reconnue"):
         resolve_day("bientôt", TODAY)
+
+
+@pytest.mark.parametrize("when", ["aujourd'hui", "du jour", "cet après-midi", "cette semaine"])
+def test_resolve_day_accepts_current_periods(when):
+    assert resolve_day(when, TODAY) == TODAY
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "quel temps fait-il ?",
+        "quel temps fait-il aujourd'hui ?",
+        "Quelle est la météo du jour ?",
+        "quel temps fera-t-il demain ?",
+        "il va pleuvoir jeudi ?",
+        "quel temps va-t-il faire cette semaine ?",
+        "quel temps fait-il à Paris ?",
+        "quel temps fait-il aujourd'hui à Lyon ?",
+        "Quelle est la météo du jour à Caen ?",
+        "quel temps fera-t-il demain à Marseille ?",
+        "il va pleuvoir jeudi à Rennes ?",
+        "quel temps va-t-il faire cette semaine à Bordeaux ?",
+        "il va pleuvoir cet après-midi ?",
+        "il va faire chaud demain ?",
+        "fera-t-il froid jeudi ?",
+    ],
+)
+def test_weather_request_recognizes_temperature_questions(query):
+    assert is_weather_request(query)
 
 
 def test_format_day_uses_french_names():
@@ -277,7 +392,7 @@ def test_weather_agent_executes_text_tool_call_from_local_model(monkeypatch):
     assert messages[-1] is messages[2]
 
 
-def test_weather_agent_asks_for_city_instead_of_inventing_one(monkeypatch):
+def test_weather_agent_geolocates_instead_of_inventing_city(monkeypatch):
     urls = []
     monkeypatch.setattr("microchat.agents.weather.urlopen", open_meteo(NANTES, urls))
     checkpointer = InMemorySaver()
@@ -307,17 +422,53 @@ def test_weather_agent_asks_for_city_instead_of_inventing_one(monkeypatch):
     agent.invoke({"messages": [{"role": "user", "content": "La météo pour demain ?"}]}, config)
 
     messages = agent.get_state(config).values["messages"]
+    assert isinstance(messages[-1], ToolMessage)
+    assert messages[1].tool_calls[0]["args"]["city"] is None
+    assert "Nantes" in messages[-1].content
+    assert "Localisation IP approximative" in messages[-1].content
+    assert "Mardi 20 octobre" in messages[-1].content
+    assert "ipapi.co" in urls[0][0]
+    assert not any("geocoding" in url for url, _timeout in urls)
+
+
+def test_weather_agent_asks_for_city_after_failed_geolocation_and_retains_period(monkeypatch):
+    successful = open_meteo(NANTES)
+
+    def no_geolocation(request, timeout):
+        if "ipapi.co" in request.full_url:
+            return io.BytesIO(b'{"error": true}')
+        return successful(request, timeout)
+
+    monkeypatch.setattr("microchat.agents.weather.urlopen", no_geolocation)
+    checkpointer = InMemorySaver()
+    agent = build_agent(
+        ToolCallingFake(responses=[
+            AIMessage(content="", tool_calls=[{
+                "name": "get_weather", "args": {"when": "demain"}, "id": "loc-1"
+            }]),
+            AIMessage(content="Je vais chercher."),
+        ]),
+        system_prompt="Réponds en français.",
+        instructions="Utilise la météo.",
+        token_counter=count_words,
+        history_token_budget=200,
+        history_low_watermark=0.6,
+        checkpointer=checkpointer,
+        weather_timeout_seconds=5,
+    )
+    config = {"configurable": {"thread_id": "failed-geolocation"}}
+
+    agent.invoke({"messages": [HumanMessage(content="La météo pour demain ?")]}, config)
+    messages = agent.get_state(config).values["messages"]
+    assert isinstance(messages[-1], ToolMessage)
     assert messages[-1].content == ASK_CITY
-    assert not messages[-1].tool_calls
-    assert urls == []
+    assert messages[-1].artifact["pending_weather"] == {"when": "demain", "days": 1}
 
     agent.invoke({"messages": [{"role": "user", "content": "À Nantès"}]}, config)
 
     messages = agent.get_state(config).values["messages"]
     assert isinstance(messages[-1], ToolMessage)
-    assert messages[1].additional_kwargs["pending_weather"] == {"when": "demain", "days": 1}
     assert messages[-1].content.find("Mardi 20 octobre") >= 0
-    assert urls
 
 
 def test_visible_text_hides_complete_and_partial_tool_calls():

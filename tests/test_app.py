@@ -11,6 +11,7 @@ from langchain_core.language_models.fake_chat_models import FakeMessagesListChat
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
+from rich.cells import cell_len
 from rich.console import Console
 
 from microchat.agents import weather
@@ -148,7 +149,8 @@ def test_weather_tool_names_match_declared_tools():
     assert weather.make_weather_tool(timeout_seconds=1).name in weather.TOOL_NAMES
 
 
-def test_chat_app_shows_weather_icon_when_subagent_is_used(monkeypatch):
+@pytest.mark.parametrize("days,width", [(1, 100), (2, 100), (1, 40), (2, 40)])
+def test_chat_app_shows_weather_icon_when_subagent_is_used(monkeypatch, days, width):
     spinner_phases = []
     overflow_modes = []
 
@@ -188,13 +190,13 @@ def test_chat_app_shows_weather_icon_when_subagent_is_used(monkeypatch):
                         "wind_speed_10m": 12,
                     },
                     "daily": {
-                        "time": ["2026-10-19"],
-                        "weather_code": [61],
-                        "temperature_2m_min": [9],
-                        "temperature_2m_max": [15],
-                        "precipitation_sum": [2.4],
-                        "precipitation_probability_max": [70],
-                        "wind_speed_10m_max": [20],
+                        "time": ["2026-10-19", "2026-10-20"],
+                        "weather_code": [61, 0],
+                        "temperature_2m_min": [9, 10],
+                        "temperature_2m_max": [15, 16],
+                        "precipitation_sum": [2.4, 0],
+                        "precipitation_probability_max": [70, 0],
+                        "wind_speed_10m_max": [20, 10],
                     },
                 }
             ).encode("utf-8")
@@ -207,7 +209,7 @@ def test_chat_app_shows_weather_icon_when_subagent_is_used(monkeypatch):
                 AIMessage(
                     content=(
                         '<tool_call> {"name": "get_weather", '
-                        '"arguments": {"city": "Nantes"}} </tool_call>'
+                        f'"arguments": {{"city": "Nantes", "days": {days}}}}} </tool_call>'
                     )
                 ),
                 AIMessage(content="Reformulation qui ne doit pas être utilisée."),
@@ -230,14 +232,17 @@ def test_chat_app_shows_weather_icon_when_subagent_is_used(monkeypatch):
         {"get_weather": weather.ICON},
     )
     output = io.StringIO()
-    app.console = Console(file=output, force_terminal=False, width=100)
+    app.console = Console(file=output, force_terminal=False, width=width)
 
-    app._answer("Quel temps à Nantes ?")
+    app._answer(f"Quel temps à Nantes sur {days} jours ?")
 
     rendered = output.getvalue()
     assert weather.ICON in rendered
-    assert "☁️ couvert" in rendered
-    assert "🌧️ pluie faible" in rendered
+    assert "couvert" in rendered
+    assert "pluie" in rendered and "faible" in rendered
+    assert f"{'Météo' if days == 1 else 'Prévisions'} · Nantes" in rendered
+    assert any(corner in rendered for corner in ("╭", "┌"))
+    assert max(cell_len(line) for line in rendered.splitlines()) <= width
     assert "Reformulation" not in rendered
     assert app._message_count() == 2
     assert any("Appel d'un outil" in phase for phase in spinner_phases)

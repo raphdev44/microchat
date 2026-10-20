@@ -83,7 +83,18 @@ non installé provoque une erreur explicite au démarrage.
 Le plugin météo utilise l'API publique Open-Meteo, sans clé API. Il fournit les conditions
 actuelles et des prévisions jusqu'à 16 jours pour une ville. Les dates en français comme
 « demain », « samedi » ou « le 21 » sont interprétées selon la date locale de la ville; les
-prévisions peuvent couvrir plusieurs jours. Une ville est demandée si elle manque.
+prévisions peuvent couvrir plusieurs jours. « Cette semaine » couvre les jours restants
+jusqu'au dimanche ; « cet après-midi » utilise les prévisions horaires de 12 h à 18 h.
+Les questions sur la pluie, le chaud ou le froid sont également reconnues.
+
+Sans ville explicite, le tool tente une géolocalisation IP via `https://ipapi.co/json/`.
+Ce service tiers voit l'adresse IP publique de la machine ; la position est approximative
+et peut correspondre à la sortie d'un VPN ou d'un proxy. Elle est signalée dans le résultat.
+Si cette localisation échoue, le plugin demande une ville en conservant la période demandée.
+Une ville fournie explicitement évite tout appel au service de géolocalisation IP.
+
+Le tool produit directement une carte Rich pour un jour ou une partie de journée, et un
+panneau pour plusieurs jours. La restitution n'est jamais reformulée par le LLM.
 
 La consultation nécessite Internet. Configurez son délai réseau dans `config.ini` :
 
