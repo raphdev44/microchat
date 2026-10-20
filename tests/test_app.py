@@ -46,6 +46,10 @@ def test_loads_complete_ini_configuration():
     assert settings.plugin_configurations["web_search"]["max_results"] == "3"
     assert settings.plugin_configurations["rag"]["embedding_model"]
     assert int(settings.plugin_configurations["rag"]["chunk_size"]) > 150
+    assert 0 <= float(settings.plugin_configurations["rag"]["min_similarity"]) <= 1
+    assert int(settings.plugin_configurations["rag"]["max_injected_results"]) <= int(
+        settings.plugin_configurations["rag"]["max_results"]
+    )
 
 
 def test_plugin_registry_accepts_no_active_plugins():
@@ -201,7 +205,7 @@ def test_retrieved_document_frames_render_before_the_answer():
         load_config(Path("config.ini")),
         Path("fake.gguf"),
         count_words,
-        context_providers=(lambda: (("document.docx", "Fragment récupéré"),),),
+        context_providers=(lambda: (("document.docx", "Fragment récupéré", 0.876),),),
     )
     output = io.StringIO()
     app.console = Console(file=output, force_terminal=False, width=100)
@@ -211,6 +215,7 @@ def test_retrieved_document_frames_render_before_the_answer():
     rendered = output.getvalue()
     assert "Fragment documentaire" in rendered
     assert "Fragment récupéré" in rendered
+    assert "Similarité cosinus : 0.876" in rendered
     assert rendered.index("Fragment récupéré") < rendered.index("Réponse finale")
 
 

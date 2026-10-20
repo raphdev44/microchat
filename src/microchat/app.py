@@ -332,7 +332,7 @@ class ChatApp:
         token_counter: Callable[[Sequence[BaseMessage]], int],
         tool_icons: Mapping[str, str] | None = None,
         plugin_commands: Mapping[str, PluginCommand] | None = None,
-        context_providers: Sequence[Callable[[], Sequence[tuple[str, str]]]] = (),
+        context_providers: Sequence[Callable[[], Sequence[tuple[str, str, float]]]] = (),
     ) -> None:
         self.agent = agent
         self.checkpointer = checkpointer
@@ -456,12 +456,15 @@ class ChatApp:
 
         def show_retrieved_context() -> None:
             for provider in self.context_providers:
-                for source, fragment in provider():
+                for source, fragment, similarity in provider():
                     body = Text(f"{source}\n{fragment}", style="grey70")
                     self.console.print(
                         Panel(
                             body,
                             title=Text("Fragment documentaire", style="grey70"),
+                            subtitle=Text(
+                                f"Similarité cosinus : {similarity:.3f}", style="grey70"
+                            ),
                             border_style="grey50",
                             expand=True,
                         )

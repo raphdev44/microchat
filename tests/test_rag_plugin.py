@@ -106,6 +106,107 @@ def test_rejects_invalid_chunk_size(tmp_path, chunk_size):
         rag.load_plugin({"chunk_size": chunk_size, "index_path": str(tmp_path / "index.json")})
 
 
+@pytest.mark.parametrize("min_similarity", ["invalid", "-0.1", "1.01"])
+def test_rejects_invalid_min_similarity(tmp_path, min_similarity):
+    with pytest.raises(ValueError, match="min_similarity"):
+        rag.load_plugin(
+            {
+                "min_similarity": min_similarity,
+                "index_path": str(tmp_path / "index.json"),
+            }
+        )
+
+
+def test_search_filters_below_min_similarity(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        rag,
+        "_embed",
+        lambda texts, model_name=rag.EMBEDDING_MODEL, on_progress=None: [[1.0, 0.0]],
+    )
+    index_path = tmp_path / "index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "chunks": [
+                    {"source": "doc", "text": "threshold match", "vector": [0.8, 0.6]},
+                    {"source": "doc", "text": "below threshold", "vector": [0.6, 0.8]},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    index = rag.RagIndex(index_path, max_results=2, min_similarity=0.8)
+
+    results = index.search("query")
+
+    assert [(item["text"], item["similarity"]) for item in results] == [
+        ("threshold match", 0.8)
+    ]
+
+
+def test_injects_only_best_matches_up_to_configured_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        rag,
+        "_embed",
+        lambda texts, model_name=rag.EMBEDDING_MODEL, on_progress=None: [[1.0, 0.0]],
+    )
+    index_path = tmp_path / "index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "chunks": [
+                    {"source": "doc", "text": "best", "vector": [0.9, 0.435889894]},
+                    {"source": "doc", "text": "second", "vector": [0.8, 0.6]},
+                    {"source": "doc", "text": "third", "vector": [0.7, 0.714142843]},
+                    {"source": "doc", "text": "fourth", "vector": [0.6, 0.8]},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    plugin = rag.load_plugin(
+        {
+            "index_path": str(index_path),
+            "max_results": "4",
+            "max_injected_results": "2",
+            "min_similarity": "0.0",
+        }
+    )
+    assert plugin.commands is not None
+    plugin.commands["rag_start"].handler("")
+    agent = build_agent(
+        FakeMessagesListChatModel(responses=[AIMessage(content="Réponse")]),
+        system_prompt="Réponds en français.",
+        plugins=(plugin,),
+        token_counter=lambda messages: len(messages),
+        history_token_budget=100,
+        history_low_watermark=0.6,
+        checkpointer=InMemorySaver(),
+    )
+
+    agent.invoke(
+        {"messages": [HumanMessage(content="Question")]},
+        config={"configurable": {"thread_id": "rag-injection-limit"}},
+    )
+
+    assert plugin.context_provider is not None
+    injected = plugin.context_provider()
+    assert [text for _, text, _ in injected] == ["best", "second"]
+    assert [score for _, _, score in injected] == pytest.approx([0.9, 0.8])
+
+
+@pytest.mark.parametrize("injected", ["0", "5", "invalid"])
+def test_rejects_invalid_max_injected_results(tmp_path, injected):
+    with pytest.raises(ValueError, match="max_injected_results"):
+        rag.load_plugin(
+            {
+                "max_results": "4",
+                "max_injected_results": injected,
+                "index_path": str(tmp_path / "index.json"),
+            }
+        )
+
+
 def test_embedding_reports_progress_for_each_vector(monkeypatch):
     received_batch_sizes: list[int] = []
 
@@ -171,7 +272,7 @@ def test_plugin_configures_embedding_model_for_index_and_search(tmp_path, monkey
 
     assert calls == ["custom/embedding-model", "custom/embedding-model"]
     assert plugin.context_provider is not None
-    assert plugin.context_provider() == ((str(source.resolve()), "Contenu indexé."),)
+    assert plugin.context_provider() == ((str(source.resolve()), "Contenu indexé.", 1.0),)
 
 
 def test_rag_middleware_injects_retrieved_context_only_when_started(tmp_path, monkeypatch):

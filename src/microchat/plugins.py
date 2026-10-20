@@ -20,7 +20,7 @@ class AgentPlugin:
     tool_icons: Mapping[str, str]
     middleware: Sequence[Any] = ()
     commands: Mapping[str, PluginCommand] | None = None
-    context_provider: Callable[[], Sequence[tuple[str, str]]] | None = None
+    context_provider: Callable[[], Sequence[tuple[str, str, float]]] | None = None
 
 
 PluginFactory = Callable[[Mapping[str, str]], AgentPlugin]

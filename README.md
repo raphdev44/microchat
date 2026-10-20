@@ -157,15 +157,22 @@ plugins = weather, web_search, rag
 
 [plugin:rag]
 index_path = ~/.cache/microchat/rag/index.json
-max_results = 4
+max_results = 8
+max_injected_results = 2
 chunk_size = 1200
+min_similarity = 0.35
 embedding_model = sentence-transformers/all-MiniLM-L6-v2
 ```
 
 `embedding_model` accepte un nom de modèle pris en charge par FastEmbed; le même modèle doit
 rester configuré pour indexer et rechercher dans un index existant. `chunk_size` règle le nombre
 maximal de caractères par fragment; il doit être supérieur au chevauchement fixe de 150 caractères.
-Après modification, reconstruisez l'index avec `/rag_init`, puis `/rag_index`.
+`min_similarity` conserve uniquement les fragments dont la similarité cosinus atteint ce seuil
+(entre 0 et 1); contrairement à `chunk_size` ou `embedding_model`, le changer ne demande pas de
+reconstruire l'index. `max_results` détermine combien de candidats sont évalués après ce filtre;
+`max_injected_results` limite le nombre de meilleurs candidats transmis au LLM. Il doit être
+compris entre 1 et `max_results`. Après modification du découpage ou du modèle, reconstruisez
+l'index avec `/rag_init`, puis `/rag_index`.
 
 Les commandes `/rag_index <fichier ou dossier>`, `/rag_init`, `/rag_start` et `/rag_stop`
 apparaissent dans `/help` uniquement lorsque `rag` est actif. `/rag_start` injecte les passages

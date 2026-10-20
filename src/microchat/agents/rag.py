@@ -171,11 +171,15 @@ class RagIndex:
         max_results: int,
         embedding_model: str = EMBEDDING_MODEL,
         chunk_size: int = CHUNK_SIZE,
+        min_similarity: float = 0.35,
+        max_injected_results: int | None = None,
     ) -> None:
         self.path = path
         self.max_results = max_results
         self.embedding_model = embedding_model
         self.chunk_size = chunk_size
+        self.min_similarity = min_similarity
+        self.max_injected_results = max_injected_results or max_results
 
     def initialize(self) -> str:
         """Vide l'index persistant."""
@@ -265,9 +269,17 @@ class RagIndex:
             return []
         query_vector = _embed([query], self.embedding_model)[0]
         ranked = sorted(
-            records, key=lambda item: _cosine(query_vector, item["vector"]), reverse=True
+            ((_cosine(query_vector, item["vector"]), item) for item in records),
+            key=lambda result: result[0],
+            reverse=True,
         )
-        return ranked[: self.max_results]
+        results: list[dict[str, Any]] = []
+        for score, item in ranked:
+            if score >= self.min_similarity:
+                results.append({**item, "similarity": score})
+            if len(results) >= self.max_results:
+                break
+        return results
 
 
 class RagController:
@@ -276,9 +288,9 @@ class RagController:
     def __init__(self, index: RagIndex) -> None:
         self.index = index
         self.active = False
-        self.retrieved_context: list[tuple[str, str]] = []
+        self.retrieved_context: list[tuple[str, str, float]] = []
 
-    def consume_context(self) -> tuple[tuple[str, str], ...]:
+    def consume_context(self) -> tuple[tuple[str, str, float], ...]:
         """Retourne puis vide les fragments récupérés pour l’affichage terminal."""
         context = tuple(self.retrieved_context)
         self.retrieved_context.clear()
@@ -330,11 +342,34 @@ def load_plugin(config: Mapping[str, str]) -> AgentPlugin:
             "plugin:rag chunk_size doit être supérieur au chevauchement de "
             f"{CHUNK_OVERLAP} caractères."
         )
+    try:
+        min_similarity = float(config.get("min_similarity", "0.35"))
+    except ValueError as exc:
+        raise ValueError("plugin:rag min_similarity doit être un nombre entre 0 et 1.") from exc
+    if not 0 <= min_similarity <= 1:
+        raise ValueError("plugin:rag min_similarity doit être compris entre 0 et 1.")
+    try:
+        max_injected_results = int(config.get("max_injected_results", str(max_results)))
+    except ValueError as exc:
+        raise ValueError("plugin:rag max_injected_results doit être un entier.") from exc
+    if not 1 <= max_injected_results <= max_results:
+        raise ValueError(
+            "plugin:rag max_injected_results doit être compris entre 1 et max_results."
+        )
     embedding_model = config.get("embedding_model", EMBEDDING_MODEL).strip()
     if not embedding_model:
         raise ValueError("plugin:rag embedding_model ne peut pas être vide.")
     index_path = Path(config.get("index_path", str(DEFAULT_INDEX_PATH))).expanduser()
-    controller = RagController(RagIndex(index_path, max_results, embedding_model, chunk_size))
+    controller = RagController(
+        RagIndex(
+            index_path,
+            max_results,
+            embedding_model,
+            chunk_size,
+            min_similarity,
+            max_injected_results,
+        )
+    )
 
     @wrap_model_call
     def add_retrieved_context(request: Any, handler: Any) -> Any:
@@ -353,9 +388,14 @@ def load_plugin(config: Mapping[str, str]) -> AgentPlugin:
             else:
                 query = ""
             if user_message is not None and query:
-                matches = controller.index.search(query)
+                matches = controller.index.search(query)[: controller.index.max_injected_results]
                 controller.retrieved_context.extend(
-                    (str(item["source"]), str(item["text"])) for item in matches
+                    (
+                        str(item["source"]),
+                        str(item["text"]),
+                        float(item["similarity"]),
+                    )
+                    for item in matches
                 )
                 context = (
                     "\n\n".join(f"[{item['source']}] {item['text']}" for item in matches)
