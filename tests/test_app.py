@@ -3,6 +3,7 @@ from __future__ import annotations
 import configparser
 import io
 import json
+from dataclasses import replace
 from pathlib import Path
 from urllib.error import HTTPError
 
@@ -17,7 +18,7 @@ from rich.console import Console
 from microchat.agents import weather
 from microchat.agents.runtime import build_agent
 from microchat.agents.weather import build_agent as build_weather_agent
-from microchat.app import ChatApp, _parse_command, _select_gguf, load_config
+from microchat.app import ChatApp, _parse_command, _select_gguf, build_llm, load_config
 from microchat.plugins import AgentPlugin, PluginCommand, load_plugins
 
 
@@ -39,6 +40,7 @@ def test_loads_complete_ini_configuration():
     assert settings.model_repo_id
     assert settings.n_ctx >= 512
     assert settings.history_token_budget > 0
+    assert settings.enable_thinking is False
     assert settings.session_id == "terminal"
     assert settings.plugins == ("weather", "web_search", "rag")
     assert settings.plugin_configurations["weather"]["timeout_seconds"] == "30"
@@ -50,6 +52,21 @@ def test_loads_complete_ini_configuration():
     assert int(settings.plugin_configurations["rag"]["max_injected_results"]) <= int(
         settings.plugin_configurations["rag"]["max_results"]
     )
+
+
+@pytest.mark.parametrize(
+    ("enable_thinking", "contains_marker"),
+    [(False, True), (True, False)],
+)
+def test_effective_system_prompt_follows_thinking_setting(enable_thinking, contains_marker):
+    settings = replace(
+        load_config(Path("config.ini")),
+        enable_thinking=enable_thinking,
+        system_prompt="Réponds en français. /no_think",
+    )
+
+    assert ("/no_think" in settings.effective_system_prompt) is contains_marker
+    assert "Réponds en français." in settings.effective_system_prompt
 
 
 def test_plugin_registry_accepts_no_active_plugins():
@@ -83,6 +100,27 @@ def test_config_rejects_missing_parameters(tmp_path):
 
     with pytest.raises(ValueError, match="Paramètres manquants"):
         load_config(path)
+
+
+@pytest.mark.parametrize(("enable_thinking", "should_disable"), [(False, True), (True, False)])
+def test_build_llm_respects_enable_thinking_setting(monkeypatch, enable_thinking, should_disable):
+    calls = []
+
+    class FakeChatLlamaCpp:
+        def __init__(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr("langchain_community.chat_models.ChatLlamaCpp", FakeChatLlamaCpp)
+    monkeypatch.setattr("microchat.app._disable_chat_thinking", lambda llm: calls.append(llm))
+    settings = replace(
+        load_config(Path("config.ini")),
+        enable_thinking=enable_thinking,
+        system_prompt="Réponds en français, sans marqueur de thinking.",
+    )
+
+    build_llm(settings, Path("fake.gguf"))
+
+    assert bool(calls) is should_disable
 
 
 def test_config_rejects_unknown_parameters(tmp_path):

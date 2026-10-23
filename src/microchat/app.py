@@ -61,6 +61,7 @@ class AppConfig:
     use_mlock: bool
     warm_up: bool
     flash_attn: bool
+    enable_thinking: bool
     max_tokens: int
     temperature: float
     top_p: float
@@ -80,6 +81,14 @@ class AppConfig:
     def history_token_budget(self) -> int:
         """Budget restant pour les échanges après la réponse et la marge prompt."""
         return self.n_ctx - self.max_tokens - self.prompt_reserve_tokens
+
+    @property
+    def effective_system_prompt(self) -> str:
+        """Ajoute ou retire le marqueur de réflexion selon le réglage explicite."""
+        prompt = self.system_prompt.replace("/no_think", "").strip()
+        if self.enable_thinking:
+            return prompt
+        return f"{prompt} /no_think" if prompt else "/no_think"
 
 
 def load_config(path: Path = CONFIG_PATH) -> AppConfig:
@@ -104,6 +113,7 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         "use_mlock",
         "warm_up",
         "flash_attn",
+        "enable_thinking",
         "max_tokens",
         "temperature",
         "top_p",
@@ -161,6 +171,7 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         use_mlock=read_bool("use_mlock"),
         warm_up=read_bool("warm_up"),
         flash_attn=read_bool("flash_attn"),
+        enable_thinking=read_bool("enable_thinking"),
         max_tokens=read_int("max_tokens"),
         temperature=read_float("temperature"),
         top_p=read_float("top_p"),
@@ -252,6 +263,14 @@ def _disable_chat_thinking(llm: Any) -> None:
                 globals_map["enable_thinking"] = False
 
 
+def _uses_unmarked_thinking(llm: Any) -> bool:
+    """Indique si le template préfixe une réflexion sans option dédiée."""
+    client = getattr(llm, "client", None)
+    metadata = getattr(client, "metadata", None)
+    template = metadata.get("tokenizer.chat_template", "") if isinstance(metadata, Mapping) else ""
+    return "<think>" in template and "enable_thinking" not in template
+
+
 def build_llm(settings: AppConfig, model_path: Path) -> Any:
     """Construit le modèle llama.cpp à partir des paramètres INI."""
     import psutil
@@ -275,8 +294,11 @@ def build_llm(settings: AppConfig, model_path: Path) -> Any:
         disable_streaming="tool_calling",
         model_kwargs={"n_threads_batch": threads, "flash_attn": settings.flash_attn},
     )
-    if "/no_think" in settings.system_prompt:
+    if not settings.enable_thinking:
         _disable_chat_thinking(llm)
+    llm._microchat_hide_unmarked_thinking = (
+        not settings.enable_thinking and _uses_unmarked_thinking(llm)
+    )
     return llm
 
 
@@ -333,6 +355,7 @@ class ChatApp:
         tool_icons: Mapping[str, str] | None = None,
         plugin_commands: Mapping[str, PluginCommand] | None = None,
         context_providers: Sequence[Callable[[], Sequence[tuple[str, str, float]]]] = (),
+        hide_unmarked_thinking: bool = False,
     ) -> None:
         self.agent = agent
         self.checkpointer = checkpointer
@@ -342,11 +365,19 @@ class ChatApp:
         self.tool_icons = dict(tool_icons or {})
         self.plugin_commands = dict(plugin_commands or {})
         self.context_providers = tuple(context_providers)
+        self.hide_unmarked_thinking = hide_unmarked_thinking
         self.console = Console()
         self.session_id = settings.session_id
 
     def _config(self) -> RunnableConfig:
         return RunnableConfig(configurable={"thread_id": self.session_id})
+
+    def _visible_text(self, text: str) -> str:
+        return visible_text(
+            text,
+            show_thinking=self.settings.enable_thinking,
+            hide_unmarked_thinking=self.hide_unmarked_thinking,
+        )
 
     def run(self) -> None:
         """Lance la session interactive jusqu'à /quit, Ctrl+D ou fin de flux."""
@@ -550,7 +581,7 @@ class ChatApp:
                             spinner = Spinner("dots", text=Text("Recherche web…", style="dim"))
                             live.update(render(spinner))
                             continue
-                        result = visible_text("".join(text_from_content(chunk.content)))
+                        result = self._visible_text("".join(text_from_content(chunk.content)))
                         live.update(render(tool_result(chunk, result)))
                         continue
                     if not isinstance(chunk, (AIMessage, AIMessageChunk)):
@@ -577,14 +608,14 @@ class ChatApp:
                         first_token_at = now
                     parts.append(text)
                     if now - last_render >= self.settings.render_interval_seconds:
-                        answer = visible_text("".join(parts))
+                        answer = self._visible_text("".join(parts))
                         live.update(render(Markdown(answer) if answer else spinner))
                         last_render = now
                 # Le message final peut être un résultat d'outil direct ou réécrit par un hook.
                 final = self.agent.get_state(config).values.get("messages", [])
                 last = final[-1] if final else None
                 answer = (
-                    visible_text("".join(text_from_content(last.content)))
+                    self._visible_text("".join(text_from_content(last.content)))
                     if isinstance(last, (AIMessage, ToolMessage))
                     else ""
                 )
@@ -649,7 +680,7 @@ def run() -> int:
                 try:
                     llm.client.create_chat_completion(
                         messages=[
-                            {"role": "system", "content": settings.system_prompt},
+                            {"role": "system", "content": settings.effective_system_prompt},
                             {"role": "user", "content": "Bonjour"},
                         ],
                         max_tokens=1,
@@ -662,7 +693,7 @@ def run() -> int:
         token_counter = make_token_counter(llm)
         agent = build_plugin_agent(
             llm,
-            system_prompt=settings.system_prompt,
+            system_prompt=settings.effective_system_prompt,
             plugins=plugins,
             token_counter=token_counter,
             history_token_budget=settings.history_token_budget,
@@ -687,6 +718,7 @@ def run() -> int:
             tool_icons,
             plugin_commands,
             context_providers,
+            getattr(llm, "_microchat_hide_unmarked_thinking", False),
         ).run()
     except (ValueError, RuntimeError, OSError, configparser.Error) as exc:
         print(f"Erreur : {exc}", file=sys.stderr)

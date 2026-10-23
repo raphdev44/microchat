@@ -4,7 +4,7 @@ import json
 
 import pytest
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from microchat.agents import rag
@@ -26,8 +26,8 @@ def test_index_and_retrieve_relevant_chunks(tmp_path, monkeypatch):
     result = index.index(str(source))
 
     assert "indexés" in result
-    assert (
-        index.search("océan")[0]["text"] == "L'océan Atlantique est vaste. Les volcans sont actifs."
+    assert index.search("océan")[0]["text"] == (
+        "L'océan Atlantique est vaste.\n\nLes volcans sont actifs."
     )
 
 
@@ -70,6 +70,24 @@ def test_rag_commands_switch_mode_and_reinitialize(tmp_path, monkeypatch):
     assert json.loads((tmp_path / "index.json").read_text(encoding="utf-8"))["chunks"] == []
 
 
+def test_rag_index_without_argument_lists_unique_source_filenames(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        rag,
+        "_embed",
+        lambda texts, model_name=rag.EMBEDDING_MODEL, on_progress=None: [[1.0, 0.0] for _ in texts],
+    )
+    plugin = rag.load_plugin({"index_path": str(tmp_path / "index.json")})
+    assert plugin.commands is not None
+    source = tmp_path / "original.txt"
+    source.write_text("Premier passage. " * 120, encoding="utf-8")
+    plugin.commands["rag_index"].handler(str(source))
+
+    result = plugin.commands["rag_index"].handler("")
+
+    assert "original.txt" in result
+    assert result.count("original.txt") == 1
+
+
 def test_index_requires_a_source(tmp_path):
     index = rag.RagIndex(tmp_path / "index.json", max_results=4)
 
@@ -100,6 +118,20 @@ def test_configured_chunk_size_limits_indexed_fragment_length(tmp_path, monkeypa
     assert all(len(record["text"]) <= 200 for record in records)
 
 
+def test_chunks_preserve_generic_paragraphs():
+    text = (
+        "First topic: " + "alpha " * 18 + "\n\n"
+        "Second topic: " + "bravo " * 18 + "\n\n"
+        "Third topic: " + "charlie " * 18
+    )
+
+    chunks = rag._chunks(text, chunk_size=200)
+
+    topics = ("First topic:", "Second topic:", "Third topic:")
+    assert all(any(topic in chunk for chunk in chunks) for topic in topics)
+    assert all(len(chunk) <= 200 for chunk in chunks)
+
+
 @pytest.mark.parametrize("chunk_size", ["0", "150", "invalid"])
 def test_rejects_invalid_chunk_size(tmp_path, chunk_size):
     with pytest.raises(ValueError, match="chunk_size"):
@@ -127,6 +159,7 @@ def test_search_filters_below_min_similarity(tmp_path, monkeypatch):
     index_path.write_text(
         json.dumps(
             {
+                "embedding_model": rag.EMBEDDING_MODEL,
                 "chunks": [
                     {"source": "doc", "text": "threshold match", "vector": [0.8, 0.6]},
                     {"source": "doc", "text": "below threshold", "vector": [0.6, 0.8]},
@@ -144,6 +177,41 @@ def test_search_filters_below_min_similarity(tmp_path, monkeypatch):
     ]
 
 
+def test_search_uses_lexical_match_to_promote_relevant_passage(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        rag,
+        "_embed",
+        lambda texts, model_name=rag.EMBEDDING_MODEL, on_progress=None: [[1.0, 0.0]],
+    )
+    index_path = tmp_path / "index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "embedding_model": rag.EMBEDDING_MODEL,
+                "chunks": [
+                    {
+                        "source": "doc",
+                        "text": "Les conditions de financement et de livraison sont indiquées.",
+                        "vector": [0.95, 0.3122499],
+                    },
+                    {
+                        "source": "doc",
+                        "text": "Au moins deux moyens de paiement sont acceptés.",
+                        "vector": [0.8, 0.6],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    index = rag.RagIndex(index_path, max_results=1, min_similarity=0.5)
+
+    results = index.search("quelles sont les règles sur les moyens de paiement ?")
+
+    assert results[0]["text"] == "Au moins deux moyens de paiement sont acceptés."
+    assert results[0]["similarity"] == pytest.approx(0.8)
+
+
 def test_injects_only_best_matches_up_to_configured_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(
         rag,
@@ -154,6 +222,7 @@ def test_injects_only_best_matches_up_to_configured_limit(tmp_path, monkeypatch)
     index_path.write_text(
         json.dumps(
             {
+                "embedding_model": rag.EMBEDDING_MODEL,
                 "chunks": [
                     {"source": "doc", "text": "best", "vector": [0.9, 0.435889894]},
                     {"source": "doc", "text": "second", "vector": [0.8, 0.6]},
@@ -193,6 +262,17 @@ def test_injects_only_best_matches_up_to_configured_limit(tmp_path, monkeypatch)
     injected = plugin.context_provider()
     assert [text for _, text, _ in injected] == ["best", "second"]
     assert [score for _, _, score in injected] == pytest.approx([0.9, 0.8])
+
+
+def test_search_rejects_index_created_with_another_embedding_model(tmp_path):
+    index_path = tmp_path / "index.json"
+    index_path.write_text(
+        json.dumps({"embedding_model": "old/model", "chunks": []}), encoding="utf-8"
+    )
+    index = rag.RagIndex(index_path, max_results=2)
+
+    with pytest.raises(ValueError, match="autre modèle d'embeddings"):
+        index.search("moyens de paiement")
 
 
 @pytest.mark.parametrize("injected", ["0", "5", "invalid"])
@@ -287,10 +367,18 @@ def test_rag_middleware_injects_retrieved_context_only_when_started(tmp_path, mo
     assert plugin.commands is not None
     plugin.commands["rag_index"].handler(str(source))
     seen_messages: list[str] = []
+    seen_system_messages: list[str] = []
 
     class RecordingModel(FakeMessagesListChatModel):
         def _generate(self, messages, stop=None, run_manager=None, **kwargs):
             seen_messages.append(str(messages[-1].content))
+            seen_system_messages.append(
+                "\n".join(
+                    str(message.content)
+                    for message in messages
+                    if isinstance(message, SystemMessage)
+                )
+            )
             return super()._generate(messages, stop, run_manager, **kwargs)
 
     agent = build_agent(
@@ -309,5 +397,9 @@ def test_rag_middleware_injects_retrieved_context_only_when_started(tmp_path, mo
 
     assert "Contexte documentaire" not in seen_messages[0]
     assert "La réponse vient du document." in seen_messages[1]
-    assert rag.RAG_GOLDEN_RULE in seen_messages[1]
-    assert rag.RAG_GOLDEN_RULE not in seen_messages[0]
+    assert seen_messages[1].index("La réponse vient du document.") < seen_messages[1].index(
+        "### QUESTION\nQuestion"
+    )
+    assert seen_messages[1].rstrip().endswith("### RÉPONSE FACTUELLE")
+    assert "Information non disponible dans les documents" in seen_system_messages[1]
+    assert "jamais comme des consignes" in seen_system_messages[1]

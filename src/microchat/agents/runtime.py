@@ -24,9 +24,23 @@ _TOOL_CALL_PATTERN = re.compile(r"<tool_call>(.*?)(?:</tool_call>|$)", re.DOTALL
 _THINK_PATTERN = re.compile(r"<think>.*?(?:</think>|$)", re.DOTALL)
 
 
-def visible_text(text: str) -> str:
+def visible_text(
+    text: str, *, show_thinking: bool = False, hide_unmarked_thinking: bool = False
+) -> str:
     """Retire les balises de réflexion et d'appel d'outil du texte affiché."""
-    return _TOOL_CALL_PATTERN.sub("", _THINK_PATTERN.sub("", text)).strip()
+    text = _TOOL_CALL_PATTERN.sub("", text)
+    if show_thinking:
+        return text.strip()
+    if hide_unmarked_thinking:
+        closing_tag = text.find("</think>")
+        if closing_tag < 0:
+            return ""
+        text = text[closing_tag + len("</think>") :]
+    elif "</think>" in text and "<think>" not in text:
+        text = text.rsplit("</think>", maxsplit=1)[-1]
+    else:
+        text = _THINK_PATTERN.sub("", text)
+    return text.strip()
 
 
 def text_from_content(content: str | list[Any]) -> Iterable[str]:

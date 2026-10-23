@@ -489,6 +489,14 @@ def test_visible_text_hides_complete_and_partial_tool_calls():
     assert visible_text('<tool_call> {"name": "get_wea') == ""
     assert visible_text("<think>\n\n</think>\n\nSalut !") == "Salut !"
     assert visible_text("<think>\nje réfléch") == ""
+    assert visible_text("raisonnement privé</think>Bonjour") == "Bonjour"
+    assert visible_text("raisonnement privé", hide_unmarked_thinking=True) == ""
+    assert visible_text(
+        "raisonnement privé</think>Bonjour", hide_unmarked_thinking=True
+    ) == "Bonjour"
+    assert visible_text(
+        "raisonnement privé</think>Bonjour", show_thinking=True
+    ) == "raisonnement privé</think>Bonjour"
     assert parse_text_tool_calls("Bonjour") == []
 
 
